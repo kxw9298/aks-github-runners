@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 560" width="760" height="560" role="img" aria-label="Each org runs on its own nodes, and idle runner capacity is zero" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13">
+  <title>Each org runs on its own nodes, and idle runner capacity is zero</title>
+  <defs>
+    <marker id="arch-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#8c959f"/>
+    </marker>
+  </defs>
+  <rect width="760" height="560" fill="#ffffff"/>
+
+  <text x="24" y="32" font-size="15" font-weight="600" fill="#1f2328">Each org runs on its own nodes, and idle runner capacity is zero</text>
+  <text x="24" y="52" font-size="11.5" fill="#59636e">All calls to GitHub go outbound through the firewall; runner pods and org nodes exist only while jobs run</text>
+
+  <!-- GitHub -->
+  <rect x="24" y="76" width="152" height="380" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="100" y="100" text-anchor="middle" font-weight="600" fill="#1f2328">GitHub (GHEC)</text>
+  <text x="100" y="444" text-anchor="middle" font-size="11.5" fill="#59636e">+ more orgs</text>
+
+  <rect x="40" y="216" width="120" height="72" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="100" y="240" text-anchor="middle" font-weight="600" fill="#1f2328">Org A</text>
+  <text x="100" y="256" text-anchor="middle" font-size="11.5" fill="#59636e">GitHub App A</text>
+  <text x="100" y="272" text-anchor="middle" font-size="11.5" fill="#59636e">runner group A</text>
+
+  <rect x="40" y="352" width="120" height="72" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="100" y="376" text-anchor="middle" font-weight="600" fill="#1f2328">Org B</text>
+  <text x="100" y="392" text-anchor="middle" font-size="11.5" fill="#59636e">GitHub App B</text>
+  <text x="100" y="408" text-anchor="middle" font-size="11.5" fill="#59636e">runner group B</text>
+
+  <!-- Firewall -->
+  <rect x="192" y="76" width="28" height="380" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="210" y="266" transform="rotate(-90 210 266)" text-anchor="middle" font-size="12" font-weight="600" fill="#1f2328">Azure Firewall · egress allowlist</text>
+
+  <!-- AKS cluster -->
+  <rect x="236" y="76" width="500" height="380" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="252" y="100" font-weight="600" fill="#1f2328">AKS cluster · private · Azure Linux 3 nodes</text>
+
+  <rect x="252" y="112" width="468" height="56" rx="8" fill="#eef0f2" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="268" y="136" font-weight="600" fill="#1f2328">System node pool · always on</text>
+  <text x="268" y="152" font-size="11.5" fill="#59636e">ARC controller · one listener per scale set · CoreDNS · Cilium</text>
+
+  <!-- Org A lane -->
+  <rect x="252" y="184" width="468" height="120" rx="8" fill="none" stroke="#d1d9e0" stroke-width="1.25"/>
+  <text x="268" y="206" font-weight="600" fill="#1f2328">Org A boundary · namespace arc-org-a</text>
+  <rect x="268" y="216" width="116" height="72" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="326" y="240" text-anchor="middle" font-weight="600" fill="#1f2328">Scale sets</text>
+  <text x="326" y="256" text-anchor="middle" font-size="11.5" fill="#59636e">linux, docker</text>
+  <rect x="400" y="216" width="160" height="72" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="480" y="240" text-anchor="middle" font-weight="600" fill="#1f2328">Runner pods</text>
+  <text x="480" y="256" text-anchor="middle" font-size="11.5" fill="#59636e">1 pod per job</text>
+  <text x="480" y="272" text-anchor="middle" font-size="11.5" fill="#59636e">Docker jobs: Kata VM</text>
+  <rect x="576" y="216" width="128" height="72" rx="8" fill="#0969da" fill-opacity="0.12" stroke="#0969da" stroke-width="2"/>
+  <text x="640" y="240" text-anchor="middle" font-weight="600" fill="#1f2328">Org A nodes</text>
+  <text x="640" y="256" text-anchor="middle" font-size="11.5" fill="#1f2328">tainted, 0 to N</text>
+
+  <!-- Org B lane -->
+  <rect x="252" y="320" width="468" height="120" rx="8" fill="none" stroke="#d1d9e0" stroke-width="1.25"/>
+  <text x="268" y="342" font-weight="600" fill="#1f2328">Org B boundary · namespace arc-org-b</text>
+  <rect x="268" y="352" width="116" height="72" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="326" y="376" text-anchor="middle" font-weight="600" fill="#1f2328">Scale sets</text>
+  <text x="326" y="392" text-anchor="middle" font-size="11.5" fill="#59636e">linux, docker</text>
+  <rect x="400" y="352" width="160" height="72" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="480" y="376" text-anchor="middle" font-weight="600" fill="#1f2328">Runner pods</text>
+  <text x="480" y="392" text-anchor="middle" font-size="11.5" fill="#59636e">1 pod per job</text>
+  <text x="480" y="408" text-anchor="middle" font-size="11.5" fill="#59636e">Docker jobs: Kata VM</text>
+  <rect x="576" y="352" width="128" height="72" rx="8" fill="#0969da" fill-opacity="0.12" stroke="#0969da" stroke-width="2"/>
+  <text x="640" y="376" text-anchor="middle" font-weight="600" fill="#1f2328">Org B nodes</text>
+  <text x="640" y="392" text-anchor="middle" font-size="11.5" fill="#1f2328">tainted, 0 to N</text>
+
+  <!-- Connectors -->
+  <g fill="none" stroke="#8c959f" stroke-width="1.25" marker-end="url(#arch-arrow)">
+    <path d="M384 252H400"/>
+    <path d="M560 252H576"/>
+    <path d="M384 388H400"/>
+    <path d="M560 388H576"/>
+    <path d="M252 252H220"/>
+    <path d="M192 252H160"/>
+    <path d="M252 388H220"/>
+    <path d="M192 388H160"/>
+    <path d="M252 140H220"/>
+    <path d="M192 140H176"/>
+    <path d="M314 480V456"/>
+    <path d="M486 480V456"/>
+    <path d="M658 456V480"/>
+  </g>
+  <text x="322" y="472" font-size="11.5" fill="#59636e">image pull</text>
+  <text x="494" y="472" font-size="11.5" fill="#59636e">key sync</text>
+  <text x="666" y="472" font-size="11.5" fill="#59636e">telemetry</text>
+
+  <!-- Shared services -->
+  <rect x="236" y="480" width="156" height="56" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="314" y="504" text-anchor="middle" font-weight="600" fill="#1f2328">ACR</text>
+  <text x="314" y="520" text-anchor="middle" font-size="11.5" fill="#59636e">signed golden image</text>
+  <rect x="408" y="480" width="156" height="56" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="486" y="504" text-anchor="middle" font-weight="600" fill="#1f2328">Key Vault per org</text>
+  <text x="486" y="520" text-anchor="middle" font-size="11.5" fill="#59636e">GitHub App keys</text>
+  <rect x="580" y="480" width="156" height="56" rx="8" fill="none" stroke="#8c959f" stroke-width="1.25"/>
+  <text x="658" y="504" text-anchor="middle" font-weight="600" fill="#1f2328">Azure Monitor</text>
+  <text x="658" y="520" text-anchor="middle" font-size="11.5" fill="#59636e">Prometheus + logs</text>
+
+  <!-- Key -->
+  <rect x="24" y="486" width="14" height="14" rx="3" fill="#eef0f2" stroke="#8c959f" stroke-width="1"/>
+  <text x="46" y="497" font-size="11.5" fill="#59636e">always on (fixed cost)</text>
+  <rect x="24" y="514" width="14" height="14" rx="3" fill="#0969da" fill-opacity="0.12" stroke="#0969da" stroke-width="2"/>
+  <text x="46" y="525" font-size="11.5" fill="#59636e">dedicated VMs, 0 when idle</text>
+</svg>
