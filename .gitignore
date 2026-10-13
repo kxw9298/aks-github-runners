@@ -1,0 +1,11 @@
+.poc-state/
+*.pem
+*.key
+__pycache__/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars
+*.tfvars.json
+crash.log

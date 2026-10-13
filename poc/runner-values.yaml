@@ -1,0 +1,52 @@
+githubConfigUrl: https://github.com/kxw9298/aks-github-runners
+githubConfigSecret: github-app
+runnerScaleSetName: aks-poc-linux
+minRunners: 0
+maxRunners: 1
+containerMode:
+  type: kubernetes-novolume
+controllerServiceAccount:
+  namespace: arc-system
+  name: arc-gha-rs-controller
+listenerTemplate:
+  spec:
+    nodeSelector:
+      kubernetes.azure.com/agentpool: system
+    containers:
+      - name: listener
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
+template:
+  spec:
+    nodeSelector:
+      kubernetes.azure.com/agentpool: system
+    containers:
+      - name: runner
+        image: ghcr.io/actions/actions-runner:2.338.0
+        command: ["/home/runner/run.sh"]
+        env:
+          - name: ACTIONS_RUNNER_REQUIRE_JOB_CONTAINER
+            value: "true"
+          - name: ACTIONS_RUNNER_CONTAINER_HOOK_TEMPLATE
+            value: /home/runner/hook-template.yaml
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+        volumeMounts:
+          - name: hook-template
+            mountPath: /home/runner/hook-template.yaml
+            subPath: hook-template.yaml
+            readOnly: true
+    volumes:
+      - name: hook-template
+        configMap:
+          name: runner-hook-template

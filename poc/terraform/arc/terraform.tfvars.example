@@ -1,0 +1,7 @@
+kubeconfig_path            = "../../../.poc-state/kubeconfig"
+enable_runners             = false
+repository                 = "kxw9298/aks-github-runners"
+scale_set_name             = "aks-poc-linux"
+key_vault_uri              = "https://YOUR_VAULT.vault.azure.net/"
+vault_reader_client_id     = "REPLACE_WITH_AZURE_STACK_OUTPUT"
+tenant_id                  = "REPLACE_WITH_AZURE_STACK_OUTPUT"

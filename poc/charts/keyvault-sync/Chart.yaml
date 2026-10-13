@@ -1,0 +1,5 @@
+apiVersion: v2
+name: keyvault-sync
+description: Namespace-scoped Key Vault credential synchronization for ARC
+type: application
+version: 0.1.0
