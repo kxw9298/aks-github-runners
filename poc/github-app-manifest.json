@@ -1,7 +1,7 @@
 {
   "name": "kxw9298-aks-runner-poc",
   "url": "https://github.com/kxw9298/aks-github-runners",
-  "redirect_url": "http://127.0.0.1:8765/callback",
+  "redirect_url": "http://localhost:8765/callback",
   "public": false,
   "hook_attributes": {
     "url": "https://example.com/unused",

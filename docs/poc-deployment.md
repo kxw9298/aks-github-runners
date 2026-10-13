@@ -22,7 +22,7 @@ Setup started October 12, 2026 (America/New_York).
   was `1/1` Ready with its pod Running and zero restarts.
 - Rendered both ARC 0.15.0 charts locally; checked the controller service-account name,
   no-volume hooks, custom template mount, and runner-image injection.
-- GitHub App setup reached the account verification screen; user verification is pending.
+- GitHub App setup initially reached account verification; verification was subsequently completed.
 
 ## Infrastructure-as-code adoption
 
@@ -43,16 +43,41 @@ Terraform; Helm charts and values remain the deployment specification for ARC.
   `1/1` Ready, with its original pod Running and zero restarts.
 - State and local deployment inputs are ignored by Git. Local state files and
   backups have mode 600. State contains credentials; see the setup guide.
-- `enable_runners` remains false pending GitHub account verification and App installation.
+- `enable_runners` was subsequently enabled after the App setup recorded below.
+
+## GitHub App and runner scale-set setup
+
+At approximately 9:45 PM EDT on October 12, 2026:
+
+- Created private App `kxw9298-aks-runner-poc`, App ID `5294310`.
+- Installed only on `kxw9298/aks-github-runners`, installation ID `170808246`.
+- Permissions: repository Administration read/write and Metadata read only.
+  Webhooks, OAuth user authorization, and organization permissions are unused.
+- Manifest registration initially failed callback-URL validation. The standard
+  GitHub form was used with the settings declared in the repository.
+- Generated one App key and copied it to ignored `.poc-state/github-app.pem`
+  with mode 600. Credential content was not printed or committed.
+- Verified the key through App JWT requests to `/app`, the installation, and
+  the repository-installation endpoints; all IDs, permissions and selected
+  repository scope matched.
+- Enabled runners in local Terraform inputs and applied a reviewed plan:
+  2 resources added (Kubernetes App Secret and runner Helm release), no other
+  resources changed or destroyed.
+- Scale set `aks-poc-linux` was `Running`; listener
+  `aks-poc-linux-cd5c7bbb-listener` in `arc-system` was `1/1` Ready, Running,
+  with zero restarts. There were no runner pods at idle.
+- The final ARC Terraform plan exited 0 with **No changes**.
+- Workflow execution remains pending: PR #1 is still a draft, and the manually
+  dispatched workflow must exist on the default branch before testing.
 
 ## Live runner validation results
 
 | Check | Result |
 | --- | --- |
 | AKS node Ready | Passed |
-| GitHub App created and installed on this repository only | Pending |
+| GitHub App created and installed on this repository only | Passed |
 | ARC controller Ready | Passed |
-| ARC listener Ready | Pending: App installation required |
+| ARC listener Ready | Passed |
 | Smoke workflow succeeds on AKS | Pending |
 | Runner/job pods return to zero | Pending |
 | Runner nodes return to zero | Deferred: current shared-node PoC cannot test this |

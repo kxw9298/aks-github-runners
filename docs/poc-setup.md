@@ -153,26 +153,43 @@ Terraform. There is no separate direct Helm deployment path.
 
 ## 4. Register and install the GitHub App
 
-App registration is an account bootstrap through GitHub's manifest flow;
-GitHub requires interactive verification and installation approval. Its
-permissions and settings are declared in `poc/github-app-manifest.json`.
-The helper submits that manifest and handles the one-time credential exchange:
+GitHub App registration is an account bootstrap requiring interactive account
+verification and installation approval. Its required permissions are declared
+in `poc/github-app-manifest.json`. The standard GitHub form below is the path
+used and verified for this PoC.
 
-```bash
-python3 poc/register-app.py
-```
+1. Open <https://github.com/settings/apps/new> in the signed-in browser.
+   Complete any account verification directly in GitHub.
+2. Name the App `kxw9298-aks-runner-poc`. Set Homepage URL to
+   `https://github.com/kxw9298/aks-github-runners`.
+3. Leave OAuth user authorization, device flow and redirect URIs unused.
+   Under Webhook, clear **Active**; ARC does not require a webhook endpoint.
+4. Expand Repository permissions. Set **Administration → Read and write**.
+   GitHub automatically adds **Metadata → Read-only**. Leave other repository,
+   organization, account and enterprise permissions unset.
+5. Choose **Only on this account**, then **Create GitHub App**.
+6. Record the App ID. Open **Credentials → Key pairs → New key** (or the
+   **generate a private key** link). GitHub downloads the PEM key.
+7. Open **Install App**, choose the `kxw9298` account, and select **Only select
+   repositories → aks-github-runners**. Verify one repository is selected,
+   then install. Record the installation ID from the resulting settings URL.
+8. Copy the downloaded key to `.poc-state/github-app.pem` with mode 600.
+   Do not print the key, commit it, or paste it into chat or a command argument.
 
-Open the printed localhost URL in the signed-in browser and keep the helper
-running through the callback. Complete any GitHub verification directly in
-the browser. Review the private App's repository permissions: Administration
-read/write (required for repository runner registration) and Metadata read.
-No organization access, code-content permission, or active webhook is requested.
+The verified App has ID `5294310`; its repository-only installation is
+`170808246`. Its settings are at
+<https://github.com/settings/apps/kxw9298-aks-runner-poc> and installation scope
+at <https://github.com/settings/installations/170808246>. The App JWT was tested
+against GitHub's `/app`, installation, and repository-installation endpoints:
+all returned the expected IDs and Administration/Metadata permissions.
 
-Install on the `kxw9298` account using **Only select repositories →
-aks-github-runners**. Record the App ID and installation ID. The helper saves
-the PEM key and non-secret metadata in `.poc-state/` with mode 600 and prints
-no key contents. It refuses to overwrite an existing App key. Stop the helper
-with Ctrl-C after installation.
+An optional manifest helper is included in `poc/register-app.py`. It binds only
+to loopback, submits the checked-in manifest, and exchanges the callback code
+without logging credentials. The initial callback URL was rejected by GitHub,
+so this live deployment used the standard form above. The helper was corrected
+to pass CSRF state on GitHub's registration URL rather than inside the callback
+URL, following GitHub's documented flow; that corrected registration path has
+not been tested by creating another App. Use the verified form for this PoC.
 
 ## 5. Enable the runner scale set through Terraform
 

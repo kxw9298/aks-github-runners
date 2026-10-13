@@ -23,12 +23,12 @@ def main():
     if (state_dir / "github-app.pem").exists():
         parser.error("An App key already exists in .poc-state; use the existing App rather than overwrite it.")
     nonce = secrets.token_urlsafe(32)
-    origin = f"http://127.0.0.1:{args.port}"
+    origin = f"http://localhost:{args.port}"
     manifest = json.loads((Path(__file__).parent / "github-app-manifest.json").read_text())
     manifest.update(
         name=args.name,
         url=f"https://github.com/{args.owner}/aks-github-runners",
-        redirect_url=f"{origin}/callback?state={nonce}",
+        redirect_url=f"{origin}/callback",
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -57,7 +57,7 @@ def main():
                 <p>Repository administration: read/write. Metadata: read.
                 No code-content permission, org permission, or webhook.</p>
                 <p>After registration, install on <strong>aks-github-runners only</strong>.</p>
-                <form method="post" action="https://github.com/settings/apps/new">
+                <form method="post" action="https://github.com/settings/apps/new?state={nonce}">
                 <input type="hidden" name="manifest" value="{html.escape(json.dumps(manifest), quote=True)}">
                 <button type="submit">Continue to GitHub</button></form></body></html>""")
                 return
