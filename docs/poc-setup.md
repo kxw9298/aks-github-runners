@@ -202,7 +202,7 @@ not been tested by creating another App. Use the verified form for this PoC.
 Follow [keyvault-credentials.md](keyvault-credentials.md) to initialize the
 credentials stack, set its non-secret vault/identity inputs, and upload the
 App credential through write-only arguments. Kubeconfig/SSH recovery backups
-are optional and currently disabled, pending explicit approval. This requires
+are optional; they were explicitly approved and enabled for this PoC. This requires
 Terraform 1.11 or newer; the setup machine has a
 workspace-local Terraform at `.poc-state/bin/terraform`.
 

@@ -6,17 +6,17 @@ values use Terraform 1.11+ ephemeral variables and AzureRM `value_wo` arguments,
 so the credentials stack does not persist those values in plans or state.
 
 The deployed vault is `kvakspoc247fda1b6a` in `rg-aks-github-runners-poc`.
-The App credential is migrated and synchronization is verified. Optional AKS
-recovery credentials are not uploaded: explicit approval for those additional
-credential payloads is pending, so their configuration remains disabled.
+The App credential is migrated and synchronization is verified. The optional
+AKS recovery credentials were uploaded after explicit approval and are enabled
+in this PoC's ignored credentials-stack inputs.
 
 ## Stored credentials and access
 
 | Vault secret | Contents | Runtime access |
 | --- | --- | --- |
 | `github-app-credentials` | JSON: App ID, installation ID, PEM private key | Dedicated workload identity, restricted to this secret |
-| `aks-kubeconfig` (optional; disabled by default) | Base64-encoded local admin kubeconfig, for recovery | Setup operator only |
-| `aks-ssh-private-key` (optional; disabled by default) | Base64-encoded PoC SSH private key, for recovery | Setup operator only |
+| `aks-kubeconfig` (optional; enabled in this PoC) | Base64-encoded local admin kubeconfig, for recovery | Setup operator only |
+| `aks-ssh-private-key` (optional; enabled in this PoC) | Base64-encoded PoC SSH private key, for recovery | Setup operator only |
 
 The vault has Azure RBAC, purge protection, seven-day soft-delete retention,
 and a default-deny firewall allowing only the setup client's approved IP and
@@ -66,7 +66,7 @@ values, and write-only provider arguments omit values from resource state.
 The kubeconfig and SSH key are read/uploaded only when
 `include_aks_recovery_credentials = true` is explicitly enabled in the ignored
 credentials `terraform.tfvars.json`, after approval to store those credentials
-in this vault. The current PoC leaves this setting false. Continue protecting
+in this vault. The current PoC sets this to true. Continue protecting
 state because the Azure AKS resource itself still contains
 admin cluster credentials.
 

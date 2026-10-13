@@ -1,9 +1,6 @@
 name: AKS runner PoC smoke test
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - codex/aks-runner-poc
 permissions:
   contents: read
 concurrency:

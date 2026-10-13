@@ -67,8 +67,9 @@ At approximately 9:45 PM EDT on October 12, 2026:
   `aks-poc-linux-cd5c7bbb-listener` in `arc-system` was `1/1` Ready, Running,
   with zero restarts. There were no runner pods at idle.
 - The final ARC Terraform plan exited 0 with **No changes**.
-- Workflow execution remains pending: PR #1 is still a draft, and the manually
-  dispatched workflow must exist on the default branch before testing.
+- A branch-limited `push` trigger was temporarily added to test the runner before
+  merging PR #1. The trigger was removed after the successful run; the committed
+  workflow remains manual-only.
 
 ## Key Vault migration
 
@@ -97,9 +98,12 @@ At approximately 9:45 PM EDT on October 12, 2026:
 - Final live plans for Azure, credentials and ARC all exited 0 with **No changes**.
 - Local working credentials and the browser's PEM download still exist; the
   Azure AKS state still contains admin cluster credentials.
-- AKS kubeconfig/SSH vault backups are optional and remain disabled. Automatic
-  approval review rejected those extra uploads pending explicit confirmation;
-  only the App credential was uploaded.
+- After explicit approval, uploaded `aks-kubeconfig` and
+  `aks-ssh-private-key` as base64-encoded, write-only Key Vault secrets. Both
+  vault values exactly matched their protected local source files.
+- Current credentials state contains zero-length placeholders for all secret
+  values. The ARC workload identity remains restricted to the App secret and
+  received HTTP 403 for both recovery secrets.
 
 ## Workflow validation results
 
@@ -109,10 +113,22 @@ At approximately 9:45 PM EDT on October 12, 2026:
 | GitHub App created and installed on this repository only | Passed |
 | ARC controller Ready | Passed |
 | ARC listener Ready | Passed |
-| Smoke workflow succeeds on AKS | Pending |
-| Runner/job pods return to zero | Pending |
+| Smoke workflow succeeds on AKS | Passed: [run 38339039911](https://github.com/kxw9298/aks-github-runners/actions/runs/38339039911) |
+| Runner/job pods return to zero | Passed |
 | Runner nodes return to zero | Deferred: current shared-node PoC cannot test this |
 
-This file records observed results; configuration alone is not evidence of a
-successful live runner test. Update it with the workflow run URL and timestamps
-when the test completes. No credentials belong in this file.
+The smoke job started at 10:53:42 PM EDT on October 12, 2026 and completed in
+43 seconds. GitHub assigned it to ephemeral runner
+`aks-poc-linux-runner-mcnsw`; the live cluster showed that pod starting on
+`aks-system-43285734-vmss000000`. The job verified `RUNNER_ENVIRONMENT` was
+`self-hosted`, checked out this private repository, ran Node.js in the job
+container, and preserved the workspace between steps. After completion,
+`arc-runners` contained no pods and scale set `aks-poc-linux` remained Running
+with `minRunners: 0` and `maxRunners: 1`.
+
+The run emitted upstream Node.js deprecation warnings from the ARC
+`k8s-novolume` hook and a warning that the pinned checkout v4 action targets
+Node.js 20. They did not affect the successful assertions, but should be
+reviewed when upgrading ARC or the checkout action.
+
+This file records observed results. No credentials belong in this file.
