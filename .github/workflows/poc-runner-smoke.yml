@@ -1,0 +1,33 @@
+name: AKS runner PoC smoke test
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: aks-runner-poc
+  cancel-in-progress: false
+jobs:
+  smoke:
+    runs-on: aks-poc-linux
+    timeout-minutes: 10
+    container:
+      image: node:22-bookworm-slim
+    steps:
+      - name: Check out this repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Verify execution and workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = self-hosted
+          test -f README.md
+          node --version
+          uname -a
+          printf 'Runner: %s\nRepository: %s\n' "$RUNNER_NAME" "$GITHUB_REPOSITORY"
+          printf 'AKS runner smoke test passed\n' > poc-result.txt
+      - name: Verify workspace persists across steps
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(cat poc-result.txt)" = 'AKS runner smoke test passed'
+          cat poc-result.txt >> "$GITHUB_STEP_SUMMARY"
