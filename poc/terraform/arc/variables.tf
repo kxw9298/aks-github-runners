@@ -24,18 +24,17 @@ variable "enable_runners" {
   default     = false
 }
 
-variable "github_app_id" {
-  type    = string
-  default = ""
-}
-
-variable "github_app_installation_id" {
-  type    = string
-  default = ""
-}
-
-variable "github_app_private_key_file" {
+variable "key_vault_uri" {
   type        = string
-  description = "Local PEM path. Key content will be sensitive, but stored in Terraform state."
-  default     = "../../../.poc-state/github-app.pem"
+  description = "Azure stack key_vault_uri output."
+}
+
+variable "vault_reader_client_id" {
+  type        = string
+  description = "Azure stack vault_reader_client_id output."
+}
+
+variable "tenant_id" {
+  type        = string
+  description = "Azure stack tenant_id output."
 }

@@ -70,7 +70,38 @@ At approximately 9:45 PM EDT on October 12, 2026:
 - Workflow execution remains pending: PR #1 is still a draft, and the manually
   dispatched workflow must exist on the default branch before testing.
 
-## Live runner validation results
+## Key Vault migration
+
+- Terraform created vault `kvakspoc247fda1b6a`, scoped managed identity
+  `id-aks-poc-keyvault`, a federated credential and the setup operator's vault
+  role. AKS workload identity was enabled in-place, with no resource replacement.
+- Vault: RBAC enabled, purge protection enabled, seven-day soft-delete retention,
+  default-deny firewall with only the client/AKS outbound IPs permitted.
+- Upgraded Terraform through a workspace-local, checksum-verified 1.16.5 binary
+  to use ephemeral inputs and AzureRM write-only secret arguments.
+- Uploaded `github-app-credentials` using the credentials Terraform stack.
+  Stored App IDs and PEM exactly matched the working credential.
+- The reader role is scoped to that one App secret. It is not granted access
+  to the rest of the vault.
+- Terraform installed External Secrets chart `2.12.0` in `arc-system`, with
+  controller access/watch scope limited to `arc-runners`, plus the local
+  Key Vault synchronization chart.
+- The existing App Secret was removed from Terraform ownership without deletion;
+  External Secrets adopted it. SecretStore was Valid/Ready and ExternalSecret
+  was SecretSynced/Ready. The runtime PEM exactly matched the vault source.
+- A live service-account token exchange proved the workload identity could
+  retrieve the App secret (HTTP 200), and received HTTP 403 for both AKS
+  recovery-secret names. Credentials were not printed during verification.
+- Current ARC/credentials state files contain no App private key. Eight
+  obsolete saved plans / key-bearing state backups were removed after verification.
+- Final live plans for Azure, credentials and ARC all exited 0 with **No changes**.
+- Local working credentials and the browser's PEM download still exist; the
+  Azure AKS state still contains admin cluster credentials.
+- AKS kubeconfig/SSH vault backups are optional and remain disabled. Automatic
+  approval review rejected those extra uploads pending explicit confirmation;
+  only the App credential was uploaded.
+
+## Workflow validation results
 
 | Check | Result |
 | --- | --- |

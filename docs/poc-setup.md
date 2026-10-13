@@ -1,6 +1,7 @@
 # AKS GitHub runner PoC — infrastructure as code
 
-All Azure and Kubernetes infrastructure is declared in Terraform. ARC uses
+All Azure and Kubernetes infrastructure is declared in Terraform. Credentials are
+stored in Key Vault through write-only Terraform arguments. ARC uses
 Terraform-managed Helm releases with version-controlled values. Use Terraform
 for provisioning, changes, imports, and teardown; do not create or modify the
 resources with Azure CLI, kubectl apply, or direct Helm install commands.
@@ -9,15 +10,16 @@ resources with Azure CLI, kubectl apply, or direct Helm install commands.
 
 | Path | Managed objects |
 | --- | --- |
-| `poc/terraform/azure/` | Resource group, AKS cluster, system pool, managed identity, API access, network configuration, tags |
-| `poc/terraform/arc/` | Namespaces, hook ConfigMap, GitHub App Secret, controller and runner Helm releases |
+| `poc/terraform/azure/` | Resource group, AKS cluster, Key Vault, identities, federation, access and network configuration |
+| `poc/terraform/arc/` | Namespaces, hook ConfigMap, ARC/External Secrets Helm releases, vault synchronization |
+| `poc/terraform/credentials/` | Write-only vault credentials and secret-scoped runtime reader role |
 | `poc/*-values.yaml` | Pinned Helm deployment configuration |
 | `poc/hook-template.yaml` | Source for the Terraform-managed job-pod ConfigMap |
 | `poc/github-app-manifest.json` | Declarative GitHub App permissions and registration settings |
 | `.github/workflows/poc-runner-smoke.yml` | Manually triggered runner test |
 
-The two Terraform stacks have separate state. Apply Azure first, then ARC;
-destroy ARC first, then Azure. This avoids configuring Kubernetes providers
+The three Terraform stacks have separate state. Apply Azure first, then the
+credentials stack, then ARC; destroy in reverse order. This avoids configuring Kubernetes providers
 against a cluster that does not exist yet. AKS owns the VM, disk, load balancer,
 and network resources in its managed node resource group as children of the
 Terraform-managed cluster; do not separately manage those child resources.
@@ -51,7 +53,7 @@ admission remain later experiments. Use trusted code in this private repo.
 
 ## 1. Prepare local tools and inputs
 
-Required: Terraform 1.5+, Azure CLI, GitHub CLI, kubectl, Python 3 and OpenSSH.
+Required: Terraform 1.11+, Azure CLI, GitHub CLI, kubectl, Python 3 and OpenSSH.
 The provider versions and provider lock files are committed. Helm CLI is useful
 for read-only diagnosis; Terraform owns the Helm release lifecycle.
 
@@ -61,6 +63,8 @@ gh auth login --hostname github.com
 git clone https://github.com/kxw9298/aks-github-runners.git
 cd aks-github-runners
 umask 077
+export POC_TERRAFORM="$(command -v terraform)" # Must be Terraform 1.11+
+# On the setup machine instead: export POC_TERRAFORM="$PWD/.poc-state/bin/terraform"
 mkdir -p .poc-state
 chmod 700 .poc-state
 # For a new deployment only; keep the existing key when adopting a cluster:
@@ -87,10 +91,10 @@ registration and the resource group, AKS and its managed resources.
 For a new deployment:
 
 ```bash
-terraform -chdir=poc/terraform/azure init
-terraform -chdir=poc/terraform/azure validate
-terraform -chdir=poc/terraform/azure plan -out=azure.tfplan
-terraform -chdir=poc/terraform/azure apply azure.tfplan
+"$POC_TERRAFORM" -chdir=poc/terraform/azure init
+"$POC_TERRAFORM" -chdir=poc/terraform/azure validate
+"$POC_TERRAFORM" -chdir=poc/terraform/azure plan -out=azure.tfplan
+"$POC_TERRAFORM" -chdir=poc/terraform/azure apply azure.tfplan
 ```
 
 For the currently deployed cluster, import instead of creating it. These
@@ -98,11 +102,11 @@ imports have already been performed on the setup machine; do not repeat them
 against an existing state:
 
 ```bash
-terraform -chdir=poc/terraform/azure import azurerm_resource_group.poc \
+"$POC_TERRAFORM" -chdir=poc/terraform/azure import azurerm_resource_group.poc \
   /subscriptions/a48d0557-360a-4849-8b56-a73b28f66aa6/resourceGroups/rg-aks-github-runners-poc
-terraform -chdir=poc/terraform/azure import azurerm_kubernetes_cluster.poc \
+"$POC_TERRAFORM" -chdir=poc/terraform/azure import azurerm_kubernetes_cluster.poc \
   /subscriptions/a48d0557-360a-4849-8b56-a73b28f66aa6/resourceGroups/rg-aks-github-runners-poc/providers/Microsoft.ContainerService/managedClusters/aks-github-runners-poc
-terraform -chdir=poc/terraform/azure plan
+"$POC_TERRAFORM" -chdir=poc/terraform/azure plan
 ```
 
 Review any change before applying, particularly resource replacement. The
@@ -129,23 +133,25 @@ change the allowlist independently of Terraform.
 
 ```bash
 cp poc/terraform/arc/terraform.tfvars.example poc/terraform/arc/terraform.tfvars
-terraform -chdir=poc/terraform/arc init
-terraform -chdir=poc/terraform/arc validate
-terraform -chdir=poc/terraform/arc plan -out=arc.tfplan
-terraform -chdir=poc/terraform/arc apply arc.tfplan
+"$POC_TERRAFORM" -chdir=poc/terraform/arc init
+"$POC_TERRAFORM" -chdir=poc/terraform/arc validate
+"$POC_TERRAFORM" -chdir=poc/terraform/arc plan -out=arc.tfplan
+"$POC_TERRAFORM" -chdir=poc/terraform/arc apply arc.tfplan
 ```
 
 Again, use existing local `.tfvars.json` inputs instead of copying a second
-input file on the setup machine. Leave `enable_runners = false` until the App
-is installed. This deploys the controller, two namespaces and hook ConfigMap.
+input file on the setup machine. Set the vault URI, reader client ID and tenant ID from the Azure outputs.
+Leave `enable_runners = false` until the App is installed and its credentials
+are uploaded to Key Vault. This deploys the controller, External Secrets, two
+namespaces and hook ConfigMap.
 
 The existing objects were adopted with these Terraform imports:
 
 ```bash
-terraform -chdir=poc/terraform/arc import kubernetes_namespace_v1.system arc-system
-terraform -chdir=poc/terraform/arc import kubernetes_namespace_v1.runners arc-runners
-terraform -chdir=poc/terraform/arc import kubernetes_config_map_v1.hook arc-runners/runner-hook-template
-terraform -chdir=poc/terraform/arc import helm_release.controller arc-system/arc
+"$POC_TERRAFORM" -chdir=poc/terraform/arc import kubernetes_namespace_v1.system arc-system
+"$POC_TERRAFORM" -chdir=poc/terraform/arc import kubernetes_namespace_v1.runners arc-runners
+"$POC_TERRAFORM" -chdir=poc/terraform/arc import kubernetes_config_map_v1.hook arc-runners/runner-hook-template
+"$POC_TERRAFORM" -chdir=poc/terraform/arc import helm_release.controller arc-system/arc
 ```
 
 The adoption apply records the installed Helm chart repository and values in
@@ -191,39 +197,46 @@ to pass CSRF state on GitHub's registration URL rather than inside the callback
 URL, following GitHub's documented flow; that corrected registration path has
 not been tested by creating another App. Use the verified form for this PoC.
 
-## 5. Enable the runner scale set through Terraform
+## 5. Upload credentials and enable vault-backed runners
 
-Edit the ARC stack's ignored inputs:
-
-```hcl
-enable_runners             = true
-github_app_id              = "YOUR_APP_ID"
-github_app_installation_id = "YOUR_INSTALLATION_ID"
-github_app_private_key_file = "../../../.poc-state/github-app.pem"
-```
+Follow [keyvault-credentials.md](keyvault-credentials.md) to initialize the
+credentials stack, set its non-secret vault/identity inputs, and upload the
+App credential through write-only arguments. Kubeconfig/SSH recovery backups
+are optional and currently disabled, pending explicit approval. This requires
+Terraform 1.11 or newer; the setup machine has a
+workspace-local Terraform at `.poc-state/bin/terraform`.
 
 ```bash
-terraform -chdir=poc/terraform/arc plan -out=runners.tfplan
-terraform -chdir=poc/terraform/arc apply runners.tfplan
-kubectl get pods -n arc-system
-kubectl get pods -n arc-runners
+python3 poc/manage-credentials.py plan -out=credentials.tfplan
+python3 poc/manage-credentials.py apply credentials.tfplan
 ```
 
-Terraform creates the Kubernetes Secret and the runner Helm release. Helm
-references the Secret; the key is not placed in literal shell arguments or
-version-controlled values. Generated job pods disable service-account token
-mounting through the hook template. Job containers are mandatory.
+Then set `enable_runners = true`, `key_vault_uri`, `vault_reader_client_id` and
+`tenant_id` in the ARC stack's ignored inputs. Apply the reviewed ARC plan:
+
+```bash
+"$POC_TERRAFORM" -chdir=poc/terraform/arc plan -out=runners.tfplan
+"$POC_TERRAFORM" -chdir=poc/terraform/arc apply runners.tfplan
+kubectl get secretstore,externalsecret -n arc-runners
+kubectl get pods -n arc-system
+```
+
+Terraform manages the Helm-based External Secrets deployment, vault sync
+resources and runner release. External Secrets creates the runtime Kubernetes
+Secret from Key Vault using a scoped workload identity. Terraform does not
+read or store the App key in ARC state. Generated job pods disable service-account
+token mounting through the hook template. Job containers are mandatory.
 
 ## State and credential handling
 
-This PoC currently uses separate **local** Terraform state files. Azure state
-contains cluster credentials; ARC state contains the App key after runners
-are enabled. `sensitive()` hides values from normal Terraform output but does
-not encrypt state. State, backups, saved plans, `.terraform/`, local `.tfvars`,
-kubeconfig and PEM files are ignored by Git. Run with `umask 077` and retain a
-secure backup of both state files; losing them loses Terraform ownership.
-For team or unattended use, migrate to a secured remote backend before sharing
-access. Never commit or attach state or saved plan files to a PR.
+State remains local and is ignored by Git. The credentials stack's ephemeral
+inputs and write-only arguments keep its values out of saved plans and state.
+ARC state stores only vault references, identity IDs, and Helm configuration.
+The Azure AKS resource still contains admin cluster credentials in its state.
+Keep local state, working credentials and kubeconfig protected with mode 600
+and retain secure state backups. For team/unattended use, migrate to a secured
+remote backend. See the Key Vault guide for migration cleanup, rotation and
+recovery; marking ordinary values sensitive does not encrypt state.
 
 ## 6. Test the runner
 
@@ -260,13 +273,15 @@ credentials before sharing them.
 ## 7. Teardown through IaC
 
 After all jobs finish, destroy the ARC stack first while Kubernetes is
-reachable, then the Azure stack:
+reachable, then the credentials and Azure stacks:
 
 ```bash
-terraform -chdir=poc/terraform/arc plan -destroy -out=destroy-arc.tfplan
-terraform -chdir=poc/terraform/arc apply destroy-arc.tfplan
-terraform -chdir=poc/terraform/azure plan -destroy -out=destroy-azure.tfplan
-terraform -chdir=poc/terraform/azure apply destroy-azure.tfplan
+"$POC_TERRAFORM" -chdir=poc/terraform/arc plan -destroy -out=destroy-arc.tfplan
+"$POC_TERRAFORM" -chdir=poc/terraform/arc apply destroy-arc.tfplan
+python3 poc/manage-credentials.py plan -destroy -out=destroy-credentials.tfplan
+python3 poc/manage-credentials.py apply destroy-credentials.tfplan
+"$POC_TERRAFORM" -chdir=poc/terraform/azure plan -destroy -out=destroy-azure.tfplan
+"$POC_TERRAFORM" -chdir=poc/terraform/azure apply destroy-azure.tfplan
 ```
 
 Review each destruction plan to confirm it targets only this PoC. Terraform's

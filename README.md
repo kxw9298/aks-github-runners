@@ -16,6 +16,7 @@ Design goals:
 | [`docs/images/architecture.svg`](docs/images/architecture.svg) | Architecture diagram |
 | [`docs/poc-setup.md`](docs/poc-setup.md) | Step-by-step repository-scoped AKS/ARC PoC setup and teardown |
 | [`docs/poc-deployment.md`](docs/poc-deployment.md) | Deployment observations and live-test results |
+| [`docs/keyvault-credentials.md`](docs/keyvault-credentials.md) | Key Vault, workload identity, credential synchronization and recovery |
 | [`poc/terraform/`](poc/terraform/) | Azure infrastructure and Terraform-managed Kubernetes resources / Helm releases |
 | [`poc/`](poc/) | Pinned Helm values, job-pod template, GitHub App manifest and registration helper |
 | [`.github/workflows/poc-runner-smoke.yml`](.github/workflows/poc-runner-smoke.yml) | Manually triggered self-hosted runner smoke test |

@@ -18,6 +18,7 @@ resource "azurerm_kubernetes_cluster" "poc" {
 
   role_based_access_control_enabled = true
   oidc_issuer_enabled               = true
+  workload_identity_enabled         = true
   node_os_upgrade_channel           = "NodeImage"
 
   default_node_pool {
