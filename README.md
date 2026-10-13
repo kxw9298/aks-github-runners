@@ -16,7 +16,8 @@ Design goals:
 | [`docs/images/architecture.svg`](docs/images/architecture.svg) | Architecture diagram |
 | [`docs/poc-setup.md`](docs/poc-setup.md) | Step-by-step repository-scoped AKS/ARC PoC setup and teardown |
 | [`docs/poc-deployment.md`](docs/poc-deployment.md) | Deployment observations and live-test results |
-| [`poc/`](poc/) | Provisioning scripts, pinned ARC values, job-pod template and GitHub App registration helper |
+| [`poc/terraform/`](poc/terraform/) | Azure infrastructure and Terraform-managed Kubernetes resources / Helm releases |
+| [`poc/`](poc/) | Pinned Helm values, job-pod template, GitHub App manifest and registration helper |
 | [`.github/workflows/poc-runner-smoke.yml`](.github/workflows/poc-runner-smoke.yml) | Manually triggered self-hosted runner smoke test |
 
 ## Status
@@ -26,3 +27,7 @@ node because the Azure subscription's East US vCPU quota is 4. It tests
 repository-scoped GitHub App authentication, ephemeral ARC runners and runner-pod
 scale-to-zero. Dedicated runner-node scale-to-zero and the production image
 pipeline remain follow-up work. See the setup guide and deployment record above.
+
+All Azure and Kubernetes infrastructure is declared in Terraform. ARC is installed
+through Terraform-managed Helm releases. Existing PoC resources are adopted by
+Terraform imports; lifecycle changes use `terraform plan`, `apply`, and `destroy`.

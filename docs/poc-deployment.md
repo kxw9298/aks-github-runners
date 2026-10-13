@@ -24,7 +24,28 @@ Setup started October 12, 2026 (America/New_York).
   no-volume hooks, custom template mount, and runner-image injection.
 - GitHub App setup reached the account verification screen; user verification is pending.
 
-## Validation results
+## Infrastructure-as-code adoption
+
+The initial Azure CLI / Helm bootstrap has been superseded by two Terraform
+stacks in `poc/terraform/`. The imperative provisioning and teardown scripts
+were removed. All subsequent Azure and Kubernetes lifecycle changes use
+Terraform; Helm charts and values remain the deployment specification for ARC.
+
+- Azure: imported `azurerm_resource_group.poc` and `azurerm_kubernetes_cluster.poc`.
+- Kubernetes/Helm: imported both namespaces, the hook ConfigMap, and `helm_release.controller`.
+- Provider versions are pinned with committed dependency lock files.
+- Adoption applies changed only the load-balancer idle timeout to 30 minutes
+  and the Helm provider's recorded repository/values. No resources were created
+  or destroyed, and the AKS cluster was not replaced.
+- Both final `terraform plan -detailed-exitcode` checks exited 0 with **No changes**.
+- Both `terraform validate` checks passed; formatting checks passed.
+- After adoption the AKS node remained Ready and the ARC controller remained
+  `1/1` Ready, with its original pod Running and zero restarts.
+- State and local deployment inputs are ignored by Git. Local state files and
+  backups have mode 600. State contains credentials; see the setup guide.
+- `enable_runners` remains false pending GitHub account verification and App installation.
+
+## Live runner validation results
 
 | Check | Result |
 | --- | --- |

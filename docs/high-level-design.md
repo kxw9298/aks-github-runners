@@ -150,7 +150,7 @@ Day-2 operations:
 - **Onboard an org:** one PR from a template: namespace, quota, network policy, NodePool, Key Vault secret reference and scale sets.
 - **Drain the queue:** set `minRunners` and `maxRunners` to 0 ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)).
 - **ARC upgrades:** patch upgrades now update in place ([0.15](https://github.blog/changelog/2026-10-01-actions-runner-controller-release-0-15-0/)). Upgrades with CRD changes need scale sets uninstalled and ARC reinstalled ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)), so run them in a window, or use two clusters with separate runner groups for zero downtime.
-- **Infrastructure as code:** Terraform or Bicep for Azure; Flux or Argo CD for ARC, scale sets, NodePools and policies.
+- **Infrastructure as code:** Terraform for Azure and Kubernetes resources, with Terraform-managed Helm releases for ARC and scale sets. The PoC implementation is in `poc/terraform/`; any later GitOps migration must explicitly transfer resource ownership.
 
 ## Open decisions and rollout
 

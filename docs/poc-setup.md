@@ -1,255 +1,278 @@
-# AKS GitHub runner PoC
+# AKS GitHub runner PoC — infrastructure as code
 
-This runbook sets up a GitHub App and an ARC runner scale set for the private
-`kxw9298/aks-github-runners` repository. The test workflow is started manually.
+All Azure and Kubernetes infrastructure is declared in Terraform. ARC uses
+Terraform-managed Helm releases with version-controlled values. Use Terraform
+for provisioning, changes, imports, and teardown; do not create or modify the
+resources with Azure CLI, kubectl apply, or direct Helm install commands.
 
-## Scope and subscription constraints
+## Layout
+
+| Path | Managed objects |
+| --- | --- |
+| `poc/terraform/azure/` | Resource group, AKS cluster, system pool, managed identity, API access, network configuration, tags |
+| `poc/terraform/arc/` | Namespaces, hook ConfigMap, GitHub App Secret, controller and runner Helm releases |
+| `poc/*-values.yaml` | Pinned Helm deployment configuration |
+| `poc/hook-template.yaml` | Source for the Terraform-managed job-pod ConfigMap |
+| `poc/github-app-manifest.json` | Declarative GitHub App permissions and registration settings |
+| `.github/workflows/poc-runner-smoke.yml` | Manually triggered runner test |
+
+The two Terraform stacks have separate state. Apply Azure first, then ARC;
+destroy ARC first, then Azure. This avoids configuring Kubernetes providers
+against a cluster that does not exist yet. AKS owns the VM, disk, load balancer,
+and network resources in its managed node resource group as children of the
+Terraform-managed cluster; do not separately manage those child resources.
+
+## Current PoC settings
 
 | Setting | Value |
 | --- | --- |
-| Azure subscription | `Azure subscription 1` (`a48d0557-360a-4849-8b56-a73b28f66aa6`) |
+| Subscription | `Azure subscription 1` (`a48d0557-360a-4849-8b56-a73b28f66aa6`) |
 | Region | `eastus` |
 | Resource group | `rg-aks-github-runners-poc` |
 | Cluster | `aks-github-runners-poc` |
-| Control-plane tier | Free, no production SLA |
+| Tier | Free control plane, no production SLA |
 | Node pool | One `Standard_D4s_v4` Azure Linux 3 node, named `system` |
-| ARC charts | `0.15.0` |
-| Runner image | `ghcr.io/actions/actions-runner:2.338.0` |
-| Runner scale set | `aks-poc-linux`, minimum 0, maximum 1 |
-| Container mode | `kubernetes-novolume`; workflows must specify `container:` |
-| GitHub scope | This repository only; personal-account App |
+| Kubernetes | `1.35` (observed patch `1.35.8`) |
+| ARC charts / runner image | `0.15.0` / `2.338.0` |
+| Scale set | `aks-poc-linux`, minimum 0, maximum 1 |
+| Container mode | `kubernetes-novolume`; jobs require `container:` |
+| GitHub scope | Private repository `kxw9298/aks-github-runners` only |
 
-The initial East US regional and Dsv5-family quotas were 4 vCPUs. Requests to
-increase each to 12 were submitted, but the regional request failed with
-`ResourceNotAvailableForOffer`. `Standard_D4s_v5` was also unavailable for this
-subscription in East US; Azure listed `Standard_D4s_v4` as available.
+East US has a 4-vCPU regional quota. Both requests for 12 vCPUs failed with
+`ResourceNotAvailableForOffer`. `Standard_D4s_v5` was unavailable to this
+subscription; `Standard_D4s_v4` succeeded. The shared one-node development
+setup tests App authentication, ephemeral runners and runner-pod scale-to-zero.
+It cannot prove org isolation or runner-node scale-to-zero, and has no node
+failure availability or spare upgrade-surge capacity.
 
-Consequently this first PoC shares one development node between system
-components and runners. It can prove App authentication, workflow execution,
-ephemeral runners, and **runner-pod** scale-to-zero. It does **not** prove org
-isolation or **runner-node** scale-to-zero. The system node remains billable
-when runners are idle. AKS production guidance calls for multiple system nodes.
-The one-node setup has no node-failure availability and no upgrade surge quota.
+The public API endpoint permits only the setup client's public IPv4 CIDR.
+Private API access, firewall, Kata/Docker, golden images and signed-image
+admission remain later experiments. Use trusted code in this private repo.
 
-This PoC uses a public API endpoint restricted to the setup machine's public
-IPv4 address. It does not implement the production design's private API,
-firewall, Kata/Docker tier, golden image, or signed-image admission. Keep the
-runner restricted to trusted code in this private repository.
+## 1. Prepare local tools and inputs
 
-## 1. Prerequisites
-
-Install Azure CLI, GitHub CLI, kubectl, Helm 3, Python 3, curl, and OpenSSH.
-Authenticate locally:
+Required: Terraform 1.5+, Azure CLI, GitHub CLI, kubectl, Python 3 and OpenSSH.
+The provider versions and provider lock files are committed. Helm CLI is useful
+for read-only diagnosis; Terraform owns the Helm release lifecycle.
 
 ```bash
 az login
 gh auth login --hostname github.com
 git clone https://github.com/kxw9298/aks-github-runners.git
 cd aks-github-runners
-az account show --subscription a48d0557-360a-4849-8b56-a73b28f66aa6 -o table
-gh auth status
+umask 077
+mkdir -p .poc-state
+chmod 700 .poc-state
+# For a new deployment only; keep the existing key when adopting a cluster:
+ssh-keygen -t rsa -b 3072 -N '' -f .poc-state/id_rsa
+cp poc/terraform/azure/terraform.tfvars.example poc/terraform/azure/terraform.tfvars
 ```
 
-The setup identity needs permission to create an AKS cluster, its managed
-identity/network resources, and the dedicated resource group. GitHub access
-must include repository administration and workflow-file writes.
+Edit the copied `.tfvars`: set the allowed public IPv4 CIDR and subscription.
+For an existing cluster, preserve its deployed DNS prefix and SSH public key;
+changing immutable fields can cause replacement. The example prefix is suitable
+for a new cluster. The current imported cluster has prefix
+`aks-github-rg-aks-github-ru-a48d05`.
 
-Scripts put local kubeconfig, SSH keys, and App credentials in `.poc-state/`.
-This directory is ignored by Git and is created with mode 700. Credentials
-are never committed. Commands pass the subscription explicitly and use a
-separate kubeconfig, preserving existing Azure and Kubernetes defaults.
+Do not create `.tfvars` if the local adoption inputs `terraform.tfvars.json`
+already exist: Terraform reads both files and duplicate variable definitions
+are confusing. The setup machine already has those ignored JSON inputs.
 
-## 2. Register Azure providers and check capacity
+Provider `resource_provider_registrations = "core"` handles the Azure resource
+provider bootstrap. The setup identity needs permission for provider
+registration and the resource group, AKS and its managed resources.
+
+## 2. Apply Azure infrastructure
+
+For a new deployment:
 
 ```bash
-source poc/config.sh
-az provider register --subscription "$POC_SUBSCRIPTION" --namespace Microsoft.ContainerService
-az provider show --subscription "$POC_SUBSCRIPTION" --namespace Microsoft.ContainerService \
-  --query registrationState -o tsv
-az vm list-usage --subscription "$POC_SUBSCRIPTION" --location "$POC_LOCATION" -o table
+terraform -chdir=poc/terraform/azure init
+terraform -chdir=poc/terraform/azure validate
+terraform -chdir=poc/terraform/azure plan -out=azure.tfplan
+terraform -chdir=poc/terraform/azure apply azure.tfplan
 ```
 
-Wait for `Registered`. The current shared-node setup consumes 4 regional vCPUs.
-If Azure rejects a VM SKU, use the availability list in the error and set
-`POC_VM_SIZE` before provisioning. Do not choose a size above the available
-quota. The original request IDs and observed deployment state are recorded in
-[poc-deployment.md](poc-deployment.md).
-
-## 3. Provision AKS
+For the currently deployed cluster, import instead of creating it. These
+imports have already been performed on the setup machine; do not repeat them
+against an existing state:
 
 ```bash
-bash poc/provision.sh
+terraform -chdir=poc/terraform/azure import azurerm_resource_group.poc \
+  /subscriptions/a48d0557-360a-4849-8b56-a73b28f66aa6/resourceGroups/rg-aks-github-runners-poc
+terraform -chdir=poc/terraform/azure import azurerm_kubernetes_cluster.poc \
+  /subscriptions/a48d0557-360a-4849-8b56-a73b28f66aa6/resourceGroups/rg-aks-github-runners-poc/providers/Microsoft.ContainerService/managedClusters/aks-github-runners-poc
+terraform -chdir=poc/terraform/azure plan
 ```
 
-The script creates the tagged dedicated group and one-node cluster with Azure
-CNI Overlay/Cilium. It generates a dedicated SSH key, restricts API access to
-the client's public IP, and writes `.poc-state/kubeconfig`. AKS creates a
-separate managed node resource group for the VM, disk, and network resources.
+Review any change before applying, particularly resource replacement. The
+initial adoption normalized the load-balancer idle timeout to the declared
+30 minutes without recreating the cluster.
 
-To override defaults, export `POC_LOCATION`, `POC_SUBSCRIPTION`, `POC_VM_SIZE`, or
-`POC_CLIENT_IP` before running. Do not repoint the script to an unrelated
-existing cluster. Inspect a failed deployment before rerunning; the script
-does not automatically repair an existing failed cluster.
-
-After the client's public IP changes:
+Fetch credentials after Azure is ready. This command only establishes local
+access; it does not deploy infrastructure or change the cluster:
 
 ```bash
-source poc/config.sh
-POC_CLIENT_IP=$(curl --fail --silent --show-error https://api.ipify.org)
-az aks update --subscription "$POC_SUBSCRIPTION" -g "$POC_RESOURCE_GROUP" \
-  -n "$POC_CLUSTER" --api-server-authorized-ip-ranges "$POC_CLIENT_IP/32"
+az aks get-credentials --subscription a48d0557-360a-4849-8b56-a73b28f66aa6 \
+  --resource-group rg-aks-github-runners-poc --name aks-github-runners-poc \
+  --file "$PWD/.poc-state/kubeconfig" --overwrite-existing
+chmod 600 .poc-state/kubeconfig
+export KUBECONFIG="$PWD/.poc-state/kubeconfig"
+kubectl get nodes -o wide
 ```
 
-## 4. Create and install the GitHub App
+If the client's public IP changes, edit `authorized_ip_ranges` in the Azure
+Terraform inputs and apply the reviewed plan. Do not use `az aks update` to
+change the allowlist independently of Terraform.
 
-Run the local manifest helper:
+## 3. Apply the controller stack
+
+```bash
+cp poc/terraform/arc/terraform.tfvars.example poc/terraform/arc/terraform.tfvars
+terraform -chdir=poc/terraform/arc init
+terraform -chdir=poc/terraform/arc validate
+terraform -chdir=poc/terraform/arc plan -out=arc.tfplan
+terraform -chdir=poc/terraform/arc apply arc.tfplan
+```
+
+Again, use existing local `.tfvars.json` inputs instead of copying a second
+input file on the setup machine. Leave `enable_runners = false` until the App
+is installed. This deploys the controller, two namespaces and hook ConfigMap.
+
+The existing objects were adopted with these Terraform imports:
+
+```bash
+terraform -chdir=poc/terraform/arc import kubernetes_namespace_v1.system arc-system
+terraform -chdir=poc/terraform/arc import kubernetes_namespace_v1.runners arc-runners
+terraform -chdir=poc/terraform/arc import kubernetes_config_map_v1.hook arc-runners/runner-hook-template
+terraform -chdir=poc/terraform/arc import helm_release.controller arc-system/arc
+```
+
+The adoption apply records the installed Helm chart repository and values in
+Terraform. There is no separate direct Helm deployment path.
+
+## 4. Register and install the GitHub App
+
+App registration is an account bootstrap through GitHub's manifest flow;
+GitHub requires interactive verification and installation approval. Its
+permissions and settings are declared in `poc/github-app-manifest.json`.
+The helper submits that manifest and handles the one-time credential exchange:
 
 ```bash
 python3 poc/register-app.py
 ```
 
-Open the localhost URL printed by the helper in your signed-in browser. Keep
-the helper running until GitHub redirects back after registration. It binds
-only to `127.0.0.1` and uses a random state value to protect the callback.
-GitHub may require password/verification reauthentication; complete that
-directly in the browser.
+Open the printed localhost URL in the signed-in browser and keep the helper
+running through the callback. Complete any GitHub verification directly in
+the browser. Review the private App's repository permissions: Administration
+read/write (required for repository runner registration) and Metadata read.
+No organization access, code-content permission, or active webhook is requested.
 
-The manifest requests a private App with these repository permissions:
+Install on the `kxw9298` account using **Only select repositories →
+aks-github-runners**. Record the App ID and installation ID. The helper saves
+the PEM key and non-secret metadata in `.poc-state/` with mode 600 and prints
+no key contents. It refuses to overwrite an existing App key. Stop the helper
+with Ctrl-C after installation.
 
-- **Administration: read and write**, required to register repository runners.
-- **Metadata: read**, automatically required by GitHub.
-- No organization permissions, code-content permission, or active webhook.
+## 5. Enable the runner scale set through Terraform
 
-Review the GitHub permission page, then create the App. The helper exchanges
-GitHub's one-time manifest code and writes `.poc-state/github-app.pem` and
-non-secret metadata `.poc-state/github-app.json`, both with mode 600. It does
-not print the key, client secret, or webhook secret.
+Edit the ARC stack's ignored inputs:
 
-Follow the installation link. Select the `kxw9298` account and **Only select
-repositories → aks-github-runners**. Record the installation ID from the final
-installation-settings URL. Stop the helper with Ctrl-C after installation.
-
-If registering manually instead, visit
-<https://github.com/settings/apps/new>, choose the same permissions, disable
-webhooks, restrict the App to this account, generate a private key, and install
-on this repository only. Store the downloaded key outside tracked files.
-
-## 5. Install ARC and the scale set
-
-```bash
-export POC_APP_ID=<app-id>
-export POC_INSTALLATION_ID=<installation-id>
-export POC_APP_KEY_FILE="$PWD/.poc-state/github-app.pem"
-bash poc/install-arc.sh
+```hcl
+enable_runners             = true
+github_app_id              = "YOUR_APP_ID"
+github_app_installation_id = "YOUR_INSTALLATION_ID"
+github_app_private_key_file = "../../../.poc-state/github-app.pem"
 ```
 
-The script creates `arc-system` and `arc-runners`, stores the App key in a
-Kubernetes Secret, installs the pinned controller chart, and installs the
-scale-set chart referencing that Secret. The key is read from a file rather
-than passed as literal command-line content or embedded in Helm values.
-
-The runner has the Kubernetes API access needed by container hooks. Generated
-job pods disable service-account token mounting through the hook template.
-The workflow requires a container, so ordinary workflow steps execute in that
-job pod. This is a PoC control, not a complete tenant security boundary.
-
 ```bash
-source poc/config.sh
+terraform -chdir=poc/terraform/arc plan -out=runners.tfplan
+terraform -chdir=poc/terraform/arc apply runners.tfplan
 kubectl get pods -n arc-system
 kubectl get pods -n arc-runners
-kubectl get autoscalingrunnersets -n arc-runners
-helm list -A
 ```
 
-Expect the controller and scale-set listener to remain running at idle; there
-should be no ephemeral runner pods until a job is assigned.
+Terraform creates the Kubernetes Secret and the runner Helm release. Helm
+references the Secret; the key is not placed in literal shell arguments or
+version-controlled values. Generated job pods disable service-account token
+mounting through the hook template. Job containers are mandatory.
 
-## 6. Run the smoke test
+## State and credential handling
 
-The workflow file must first exist on the default branch for
-`workflow_dispatch` to be available. Then run:
+This PoC currently uses separate **local** Terraform state files. Azure state
+contains cluster credentials; ARC state contains the App key after runners
+are enabled. `sensitive()` hides values from normal Terraform output but does
+not encrypt state. State, backups, saved plans, `.terraform/`, local `.tfvars`,
+kubeconfig and PEM files are ignored by Git. Run with `umask 077` and retain a
+secure backup of both state files; losing them loses Terraform ownership.
+For team or unattended use, migrate to a secured remote backend before sharing
+access. Never commit or attach state or saved plan files to a PR.
+
+## 6. Test the runner
+
+The workflow must exist on the default branch for manual dispatch:
 
 ```bash
 gh workflow run poc-runner-smoke.yml --repo kxw9298/aks-github-runners --ref main
-gh run list --repo kxw9298/aks-github-runners \
-  --workflow poc-runner-smoke.yml --limit 5
+gh run list --repo kxw9298/aks-github-runners --workflow poc-runner-smoke.yml --limit 5
 gh run watch <run-id> --repo kxw9298/aks-github-runners --exit-status
-```
-
-The workflow checks out this repository, verifies it is on a self-hosted
-runner, runs Node.js in the job container, and verifies a file survives between
-steps. Its summary should say `AKS runner smoke test passed`.
-
-Watch pods during execution:
-
-```bash
-source poc/config.sh
 kubectl get pods -n arc-runners -w
 ```
 
-Record the dispatch time, runner scheduling time, workflow conclusion, and
-the time runner/job pods disappear. Repeat from idle. Completion requires a
-successful workflow and confirmation that ephemeral runners return to zero.
-Save results in [poc-deployment.md](poc-deployment.md).
+The test checks out this repository, verifies self-hosted execution, runs
+Node.js in the job container, and checks a file persists across steps. The
+summary should report `AKS runner smoke test passed`. Record the run URL,
+startup latency, and confirmation that runner/job pods disappear after the job
+in [poc-deployment.md](poc-deployment.md). Repeat from idle. Controller and
+listener pods remain running. The single shared node also remains running.
 
-## 7. Troubleshooting
-
-- Job stays queued: verify `runs-on: aks-poc-linux`, App installation scope,
-  App IDs, controller/listener readiness, and node capacity.
-- App authentication fails: inspect App permission and installation settings;
-  rotate the key and rerun `install-arc.sh` if necessary.
-- Pod remains Pending: inspect `kubectl describe pod` and node requests;
-  `maxRunners: 1` intentionally bounds concurrency within the 4-vCPU quota.
-- No-volume container job fails: inspect runner and hook logs, verify the
-  runner image contains `/home/runner/k8s-novolume/index.js`, and check the
-  hook-template mount. Every workflow must specify a job container.
-- API connection times out: check the authorized IP against the client's
-  current public IPv4 address.
-
-Use `kubectl logs -n arc-system deployment/arc-gha-rs-controller` and
-`kubectl logs -n arc-runners <listener-or-runner-pod>` for diagnostics. Avoid
-posting raw logs or Secret YAML without checking for credentials.
-
-## 8. Stop costs and tear down
-
-For a temporary pause, stop the cluster after all test jobs finish:
+Read-only diagnosis:
 
 ```bash
-source poc/config.sh
-az aks stop --subscription "$POC_SUBSCRIPTION" -g "$POC_RESOURCE_GROUP" -n "$POC_CLUSTER"
-# Resume later:
-az aks start --subscription "$POC_SUBSCRIPTION" -g "$POC_RESOURCE_GROUP" -n "$POC_CLUSTER"
+kubectl get autoscalingrunnersets -n arc-runners
+kubectl describe pod -n arc-runners <pod>
+kubectl logs -n arc-system deployment/arc-gha-rs-controller
+kubectl logs -n arc-runners <listener-or-runner-pod>
 ```
 
-Stopping the cluster stops node compute; disks and some network resources can
-still incur charges. A Free control plane does not make the VMs, disks, public
-IP, or egress free. Inspect Cost Management using the dedicated resource group
-and its managed node group. No automatic budget shutdown is configured.
+Queued jobs usually indicate App scope/credentials, the runner label, listener
+readiness, or capacity. Pending pods require checking scheduling and requests.
+Check the API allowlist if local Kubernetes access times out. Review logs for
+credentials before sharing them.
 
-To remove the PoC:
+## 7. Teardown through IaC
+
+After all jobs finish, destroy the ARC stack first while Kubernetes is
+reachable, then the Azure stack:
 
 ```bash
-POC_CONFIRM_DELETE=rg-aks-github-runners-poc bash poc/teardown.sh
+terraform -chdir=poc/terraform/arc plan -destroy -out=destroy-arc.tfplan
+terraform -chdir=poc/terraform/arc apply destroy-arc.tfplan
+terraform -chdir=poc/terraform/azure plan -destroy -out=destroy-azure.tfplan
+terraform -chdir=poc/terraform/azure apply destroy-azure.tfplan
 ```
 
-The script unregisters the scale set before deleting Azure resources. If the
-cluster is stopped, start it before using the script. Verify both the cluster
-and its managed node group are removed. In GitHub, uninstall/delete the App
-and confirm no PoC runners remain. Remove local credentials when no longer
-needed. Provider registrations and submitted quota requests are subscription
-configuration and remain after resource-group deletion.
+Review each destruction plan to confirm it targets only this PoC. Terraform's
+ARC dependencies remove the runner release before its Secret, namespace,
+controller and hook ConfigMap. AKS deletion also removes its managed node
+resources. Uninstall/delete the App in GitHub and confirm no PoC runners
+remain; account App registration is outside Terraform's Azure/Kubernetes state.
+Subscription provider registrations and historic quota requests remain.
 
-## 9. Next experiment after quota is available
+Free control-plane tier does not make the VM, disk, public IP or egress free.
+The node stays billable at idle until teardown; no budget shutdown is configured.
 
-Create a dedicated autoscaled user pool with minimum 0, maximum 1, an org label
-and taint. Move runner and generated job-pod scheduling to that pool while
-keeping the controller and listener on system nodes. Check that the first
-queued job provisions a node and that the node disappears after the jobs
-finish. Reserve additional CPU quota for system-node upgrade surges.
+## Next experiment
+
+After quota is available, add a Terraform-managed autoscaled user pool with
+minimum 0 and maximum 1. Change the checked-in runner and hook scheduling to
+its labels/taints, preserving controller/listener placement on system nodes.
+Then verify node scale-from-zero and scale-to-zero. Budget quota for system-node
+upgrade surges and multiple system nodes before production use.
 
 ## References
 
-- [GitHub: ARC authentication](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api)
-- [GitHub: register an App from a manifest](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest)
-- [GitHub: deploy runner scale sets](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)
-- [Microsoft: AKS system node pools](https://learn.microsoft.com/en-us/azure/aks/use-system-pools)
+- [AzureRM AKS resource](https://registry.terraform.io/providers/hashicorp/azurerm/4.76.0/docs/resources/kubernetes_cluster)
+- [Helm release resource](https://registry.terraform.io/providers/hashicorp/helm/2.17.0/docs/resources/release)
+- [GitHub App manifest registration](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest)
+- [GitHub ARC authentication](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/authenticate-to-the-api)

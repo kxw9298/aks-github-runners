@@ -24,15 +24,12 @@ def main():
         parser.error("An App key already exists in .poc-state; use the existing App rather than overwrite it.")
     nonce = secrets.token_urlsafe(32)
     origin = f"http://127.0.0.1:{args.port}"
-    manifest = {
-        "name": args.name,
-        "url": f"https://github.com/{args.owner}/aks-github-runners",
-        "redirect_url": f"{origin}/callback?state={nonce}",
-        "public": False,
-        "hook_attributes": {"url": "https://example.com/unused", "active": False},
-        "default_permissions": {"administration": "write", "metadata": "read"},
-        "default_events": [],
-    }
+    manifest = json.loads((Path(__file__).parent / "github-app-manifest.json").read_text())
+    manifest.update(
+        name=args.name,
+        url=f"https://github.com/{args.owner}/aks-github-runners",
+        redirect_url=f"{origin}/callback?state={nonce}",
+    )
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
