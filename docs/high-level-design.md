@@ -1,6 +1,6 @@
 # GitHub Runners on AKS — High-Level Design
 
-_As of Oct 13, 2026_
+_As of Oct 14, 2026_
 
 ## Summary
 
@@ -19,6 +19,8 @@ Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's shared AKS
 - Linux x64 jobs only in phase 1; Windows and Arm later, if at all.
 - One shared enterprise AKS cluster hosts both the runners and the shared services. A separate runner cluster is ruled out, to limit the number of clusters to operate. GitHub recommends keeping production workloads off clusters that run runners, because jobs run arbitrary code ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)); [Sharing the cluster with enterprise services](#sharing-the-cluster-with-enterprise-services) covers how the design compensates.
 - Some jobs build container images, so a Docker-capable tier is needed.
+
+**PoC scope:** the PoC in `poc/` only proves that ARC runners work on AKS (one repository, one shared node). It doesn't implement this design's isolation or security controls; the production build follows this design.
 
 ## Architecture at a glance
 
