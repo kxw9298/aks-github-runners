@@ -12,7 +12,7 @@ Design goals:
 
 | Path | What it is |
 | --- | --- |
-| [`docs/high-level-design.md`](docs/high-level-design.md) | High-level design: architecture, prod and nonprod, isolation model, cost, node storage, image and OS lifecycle, security, logging and audit, disaster recovery, operations, open decisions and rollout |
+| [`docs/high-level-design.md`](docs/high-level-design.md) | High-level design: architecture, prod and nonprod, isolation model, cost, node storage, image and OS lifecycle, security design and threat model, logging and audit, disaster recovery, monitoring and operations, open decisions and rollout |
 | [`docs/images/architecture.png`](docs/images/architecture.png) ([`.drawio`](docs/images/architecture.drawio)) | Platform architecture diagram |
 | [`docs/images/logging.png`](docs/images/logging.png) ([`.drawio`](docs/images/logging.drawio)) | Logging and audit pipeline diagram |
 | [`docs/poc-setup.md`](docs/poc-setup.md) | Step-by-step repository-scoped AKS/ARC PoC setup and teardown |
