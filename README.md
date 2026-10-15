@@ -12,8 +12,9 @@ Design goals:
 
 | Path | What it is |
 | --- | --- |
-| [`docs/high-level-design.md`](docs/high-level-design.md) | High-level design: architecture, isolation model, cost, image and OS lifecycle, security, operations, open decisions and rollout |
-| [`docs/images/architecture.svg`](docs/images/architecture.svg) | Architecture diagram |
+| [`docs/high-level-design.md`](docs/high-level-design.md) | High-level design: architecture, prod and nonprod, isolation model, cost, node storage, image and OS lifecycle, security, logging and audit, disaster recovery, operations, open decisions and rollout |
+| [`docs/images/architecture.png`](docs/images/architecture.png) ([`.drawio`](docs/images/architecture.drawio)) | Platform architecture diagram |
+| [`docs/images/logging.png`](docs/images/logging.png) ([`.drawio`](docs/images/logging.drawio)) | Logging and audit pipeline diagram |
 | [`docs/poc-setup.md`](docs/poc-setup.md) | Step-by-step repository-scoped AKS/ARC PoC setup and teardown |
 | [`docs/poc-deployment.md`](docs/poc-deployment.md) | Deployment observations and live-test results |
 | [`docs/keyvault-credentials.md`](docs/keyvault-credentials.md) | Key Vault, workload identity, credential synchronization and recovery |
