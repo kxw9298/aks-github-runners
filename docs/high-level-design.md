@@ -1,10 +1,10 @@
 # GitHub Runners on AKS — High-Level Design
 
-_As of Oct 15, 2026_
+_As of Oct 18, 2026_
 
 ## Summary
 
-Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared AKS clusters, alongside the shared services: build and test runners in the nonprod cluster, and only tightly restricted deploy runners in the prod cluster. Runners are each cluster's least-trusted tenant. Each GitHub org gets its own GitHub App, namespace and tainted node pool, runner nodes sit in a subnet that can't reach the shared services, and admission policy enforces every rule. Runner pods and runner nodes scale to zero when no jobs are queued. One OpenTelemetry pipeline plus Azure Event Hubs carries every log class to Dynatrace, Splunk, Elastic and Arctic Wolf, and prod deploy runners keep a warm standby in a DR region.
+Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared AKS clusters, alongside the shared services: build and test runners in the nonprod cluster, and only tightly restricted deploy runners in the prod cluster. Runners are each cluster's least-trusted tenant. Each GitHub org gets its own GitHub App, namespace and tainted node pool, runner nodes sit in a subnet that can't reach the shared services, and admission policy enforces every rule. Runner pods and runner nodes scale to zero when no jobs are queued. Wherever AKS has an add-on or managed feature, the design uses it instead of running its own tool: admission policy, network policy, node scaling, sandboxing, runtime detection, logs and metrics. Azure Event Hubs carries every log class to Dynatrace, Splunk, Elastic and Arctic Wolf, and prod deploy runners keep a warm standby in a DR region.
 
 | Requirement | How the design meets it |
 | --- | --- |
@@ -13,9 +13,10 @@ Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared
 | Production and non-production | Pull-request code runs only in the nonprod cluster. The prod cluster hosts only deploy runners, limited to approved workflows behind environment approvals. Platform changes reach nonprod first. |
 | Lowest spend when idle | `minRunners: 0` on every scale set; runner nodes are created on demand and removed when empty. The control plane and egress are already paid by the shared clusters, so the runner platform's idle cost is the ARC controller, its listeners and a share of registry, vault and logs. |
 | Golden image with OS lifecycle | Two layers, two owners. AKS patches the node OS weekly in a maintenance window. The platform team hardens, builds, scans, signs and promotes the runner pod image weekly and on every runner release. |
-| Logging and audit | Job logs, runner and platform logs, GitHub audit events and Azure security logs reach Dynatrace, Splunk, Elastic and Arctic Wolf through one collector pipeline and Azure Event Hubs. |
+| Logging and audit | Job logs, runner and platform logs, GitHub audit events and Azure security logs reach Dynatrace, Splunk, Elastic and Arctic Wolf through the Container insights add-on, a small job-log exporter and Azure Event Hubs. |
 | Security | A threat model maps each threat to preventive controls and detections. Policy-enforced guardrails cover namespaces, pods, containers, network, credentials, images and GitHub settings, with SIEM detections and a tested quarantine runbook. |
-| Monitoring | ARC, cluster and pipeline metrics in Dynatrace, with service-level targets, alerts routed to on-call and the SOC, and a synthetic canary job that proves each runner path end to end. |
+| Monitoring | ARC and cluster metrics in the Managed Prometheus add-on, with service-level targets, alerts routed to on-call and the SOC, and a synthetic canary job that proves each runner path end to end. |
+| Managed over self-run | AKS add-ons and managed features cover policy, networking, scaling, sandboxing, runtime detection, logs and metrics. The platform team runs only ARC, the job-log exporter and the Key Vault secret sync. |
 | Disaster recovery | Runners hold no state, so recovery is the same Terraform and Helm in another cluster. Prod deploy runners keep a warm standby; CI can fall back to GitHub-hosted runners. |
 
 **Assumptions to confirm**
@@ -24,6 +25,7 @@ Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared
 - Linux x64 jobs only in phase 1; Windows and Arm later, if at all.
 - Two shared enterprise AKS clusters, nonprod and prod, host the runners alongside the shared services. Separate runner clusters are ruled out, to limit the number of clusters to operate. GitHub recommends keeping production workloads off clusters that run runners, because jobs run arbitrary code ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)); [Production and non-production](#production-and-non-production) and [Sharing the cluster with enterprise services](#sharing-the-cluster-with-enterprise-services) cover how the design compensates.
 - Dynatrace, Splunk, Elastic and Arctic Wolf are the monitoring and security tools; others can be added the same way.
+- The shared clusters use Azure CNI Powered by Cilium for network policy, and the enterprise allows the Azure Policy, Defender, Container insights and Managed Prometheus add-ons on them.
 - Whether the enterprise has a DR-region cluster for the shared services is still to be confirmed; the DR options cover both cases.
 - Some jobs build container images, so a Docker-capable tier is needed.
 
@@ -36,6 +38,29 @@ Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared
 Each scale set's listener waits for jobs from the system pool. When a job is assigned, ARC creates a runner pod in that org's namespace, and NAP adds a node to that org's pool only if none has room. Shared services run on their own node pools in a separate subnet, which runner nodes can't reach. Both clusters share this layout; the prod cluster hosts only deploy scale sets.
 
 The diagrams are drawn in draw.io with the Azure icon set: edit [`images/architecture.drawio`](images/architecture.drawio) and [`images/logging.drawio`](images/logging.drawio), then export the PNGs.
+
+## AKS add-ons and managed features
+
+Wherever AKS offers an add-on or managed feature, the design uses it, so Microsoft patches and supports that part. The platform team runs only what has no managed equivalent.
+
+| Need | AKS add-on or managed feature | Instead of |
+| --- | --- | --- |
+| Admission policy | Pod Security Admission and ValidatingAdmissionPolicy, both built into Kubernetes, plus the Azure Policy add-on (Gatekeeper) ([Admission policy](#admission-policy)) | Kyverno |
+| Network policy | Azure CNI Powered by Cilium | A self-installed Cilium or Calico |
+| Node scaling | Node auto-provisioning (NAP); the cluster autoscaler for Kata pools | Self-managed Karpenter |
+| Job sandbox | Pod Sandboxing (Kata) | Self-installed Kata or gVisor |
+| Runtime detection | Defender for Containers sensor, through the AKS security profile | Falco or Tetragon |
+| Pod logs | Container insights (Azure Monitor add-on), then a Log Analytics data export rule to Event Hubs ([Logging and audit](#logging-and-audit)) | An OpenTelemetry collector DaemonSet and gateway |
+| Metrics, dashboards and alerts | Managed Prometheus add-on, Azure Managed Grafana and Prometheus alert rules | A self-run Prometheus or collector |
+| Network flow logs (optional) | Container network logs, part of Advanced Container Networking Services (paid) ([docs](https://learn.microsoft.com/en-us/azure/aks/container-network-observability-logs)) | Self-run Hubble |
+| Patching, image cleanup, identity, secrets encryption, cost showback | Node OS and cluster auto-upgrade channels, Image Cleaner, workload identity, KMS etcd encryption, the cost analysis add-on | Scripts and cron jobs |
+
+Considered but not used yet:
+
+- **Image Integrity** checks image signatures at admission, but it is still preview and supports only the audit effect ([docs](https://learn.microsoft.com/en-us/azure/aks/image-integrity)), so it can't block an unsigned image. Until it can, admission policy allows only digest-pinned images from the platform ACR, only the image pipeline can push there, and the pipeline verifies each signature before promoting an image.
+- **Key Vault Secrets Provider add-on** syncs a Key Vault secret into a Kubernetes secret only while a pod in the same namespace mounts it. That would put a Key Vault identity in every runner namespace, so External Secrets Operator (as in the PoC) or ARC's built-in Key Vault mode does this job instead ([GitHub App credentials](#github-app-credentials)).
+
+Still run by the platform team, because no add-on exists: ARC (controller and listeners), the job-log exporter, External Secrets Operator, and the Arctic Wolf sensor VM and syslog forwarder.
 
 ## Production and non-production
 
@@ -75,8 +100,8 @@ Each org gets its own GitHub credentials, namespace, network boundary and VMs; D
 | --- | --- | --- |
 | GitHub | One GitHub App per org, installed on that org only. Scale sets sit in a runner group limited to selected repos; public repos can't use them. | Jobs from org A landing on org B's runners; one credential working across orgs |
 | Kubernetes | Namespace per org, with namespace-scoped RBAC, ResourceQuota and LimitRange. Pod Security `restricted`; Docker scale sets get a separate `-docker` namespace. App keys are kept away from runner pods ([GitHub App credentials](#github-app-credentials)). | Reading another org's secrets; one org starving the others |
-| Network | Cilium policy: default deny, no cross-namespace traffic. Job pods can't reach the API server, the instance metadata endpoint or Azure WireServer. Egress only through the firewall allowlist. | Lateral movement; stealing a node's managed identity token |
-| Node | A node pool per org, tainted `gh-org=<org>:NoSchedule`. Admission policy injects the matching toleration and node selector into every pod, including the job pods the runner creates, and rejects other orgs' tolerations. | Two orgs' jobs sharing a kernel, disk or image cache |
+| Network | Kubernetes network policy, enforced by Azure CNI Powered by Cilium: default deny, no cross-namespace traffic. Job pods can't reach the API server, the instance metadata endpoint or Azure WireServer. Egress only through the firewall allowlist. | Lateral movement; stealing a node's managed identity token |
+| Node | A node pool per org, tainted `gh-org=<org>:NoSchedule`. The ARC Helm values and the hook template set the matching toleration and node selector on every pod, including the job pods the runner creates. Admission policy rejects pods without them, or with another org's toleration. | Two orgs' jobs sharing a kernel, disk or image cache |
 | Sandbox | The `dind` scale set uses `runtimeClassName: kata-vm-isolation`, so each job runs in its own lightweight VM. | A privileged container escape reaching the node |
 
 **Why node pools, not namespaces alone.** A namespace separates access through the Kubernetes API, but pods on the same node share its kernel and container runtime. After a container escape on a shared node, a job could read other orgs' job secrets and tokens, take a pending runner's registration token, and use the kubelet's credentials to read secrets of every pod on that node. A node pool per org limits that to the attacker's own org, at no extra idle cost because the pools scale to zero. Taints alone don't enforce this, since any pod can add a toleration; admission policy does.
@@ -105,7 +130,7 @@ Runners run arbitrary code from every repo in every onboarded org, so the design
 | Node pools separated both ways | Runner pods run only on runner node pools, and shared services only on theirs. Both sets are tainted, and admission policy rejects pods that tolerate the other side's taint. |
 | Runner subnet with an NSG | Runner node pools sit in their own subnet. Its NSG blocks the shared services' subnets, internal load balancers and private endpoints. The shared services' own network policies deny traffic from runner namespaces. |
 | Capacity limits | Runner pods get the lowest PriorityClass, and each runner NodePool has a CPU cap, so a CI burst can't starve the shared services. ARC's listener QPS and controller concurrency settings limit load on the shared API server ([changelog](https://github.blog/changelog/2026-10-01-actions-runner-controller-release-0-15-0/)). |
-| Scoped, highly available policy engine | Kyverno runs with several replicas. Runner policies select runner namespaces by label, so a policy outage or mistake blocks only runner pods, never the shared services. |
+| Fail-closed, scoped policy | The placement rules run inside the API server as ValidatingAdmissionPolicy, so there is no policy webhook that could fail open. Their bindings select runner namespaces by label, so a policy mistake blocks only runner pods, never the shared services. |
 
 **Residual risk for security to sign off before the pilot:** the control plane, API server and policy engine serve both runners and shared services. A Kubernetes vulnerability or a policy mistake could still cross over. Tier D (Kata for every job) reduces this further if needed.
 
@@ -128,8 +153,9 @@ With no queued jobs, no runner pods and no runner nodes exist. Each shared clust
 | AKS control plane and egress | Cluster API; outbound control | Already paid by the shared cluster |
 | ARC controller and listeners | One controller; one listener per scale set, on the system pool | Tight requests on listeners; fewer, multi-label scale sets |
 | ACR, Key Vault, Event Hubs, Log Analytics | Images, GitHub App keys, log routing | Short retention on runner logs; purge old images; Event Hubs sized for peak with auto-inflate |
+| Add-on agents | Container insights, Managed Prometheus, Defender and Azure Policy run pods on the system pool, and node agents on every node, runner nodes included | Count the agents' requests when sizing runner VMs; Basic plan and short retention for container logs |
 
-The trade-off is cold start: the first job after idle waits for a node to boot and the image to pull. Track it with `gha_job_startup_duration_seconds` and keep the runner image slim. Showback per org comes from namespace labels in AKS cost analysis.
+The trade-off is cold start: the first job after idle waits for a node to boot and the image to pull. Track it with `gha_job_startup_duration_seconds` and keep the runner image slim. Showback per org comes from namespace labels in the AKS cost analysis add-on.
 
 ## Node storage
 
@@ -140,7 +166,6 @@ Runners need no attached data disks or persistent volumes. Everything a job writ
 | Checkout and build output (`_work`), `/tmp` | `emptyDir` on the node's OS disk | Ephemeral-storage requests and limits per scale set |
 | Docker layers in `dind` (`/var/lib/docker`) | `emptyDir` inside the Kata pod VM | The largest image the org builds |
 | Runner and job images | The node's image cache, trimmed by Image Cleaner | Runner image plus the common job images |
-| Collector gateway retry queue | Local disk on the system pool | A few hours of peak log volume |
 
 - **Ephemeral OS disks:** NAP uses one automatically when the VM size's cache or temp disk can hold the OS disk. A NodePool requirement on `karpenter.azure.com/sku-storage-ephemeralos-maxsize` limits NAP to sizes that can, so it never falls back to a managed disk. Raise the AKSNodeClass `osDiskSizeGB` above its 128 GB default for orgs with large builds ([docs](https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning-aksnodeclass)). Ephemeral disks are faster, cost nothing extra, and are wiped with the node, along with anything a job left behind.
 - **I/O-heavy builds:** allow VM families with large local temp disks in that org's NodePool only.
@@ -182,7 +207,7 @@ The image pipeline:
 4. **Sign and push:** SBOM, signature (Notation or cosign) and an immutable tag `<runner-version>-<yyyymmdd>` in ACR; record the digest.
 5. **Canary:** roll to the platform scale set and smoke-test a container job, a service container and a Kata Docker build.
 6. **Promote by ring:** a PR bumps the digest in Helm values; the deployment pipeline rolls out platform → pilot org → all orgs.
-7. **Enforce:** admission policy admits only signed images from the platform ACR in runner namespaces.
+7. **Enforce:** admission policy admits only digest-pinned images from the platform ACR in runner namespaces, and only the pipeline can push there.
 8. **Retire:** keep the last 3 versions for rollback; ACR purge removes older ones.
 
 Rollback is a revert of the digest PR: new pods start on the previous image, with no node changes.
@@ -191,7 +216,7 @@ Rollback is a revert of the digest PR: new pods start on the previous image, wit
 
 ## Security design
 
-Runners run untrusted code from every onboarded repo, so security is layered: each threat below meets at least one preventive control and one detection. Kyverno (in enforce mode) or Azure configuration enforces every guardrail, so isolation never depends on a scale set being configured correctly. Policies live in Git, violations raise alerts, and exceptions go through a PR with an expiry date.
+Runners run untrusted code from every onboarded repo, so security is layered: each threat below meets at least one preventive control and one detection. Admission policy or Azure configuration enforces every guardrail, so isolation never depends on a scale set being configured correctly. Policies live in Git, violations raise alerts, and exceptions go through a PR with an expiry date.
 
 ### Threat model
 
@@ -202,27 +227,45 @@ Runners run untrusted code from every onboarded repo, so security is layered: ea
 | One org reaching another org's jobs, secrets or nodes | Per org: GitHub App, namespace, network policy, node pool and Key Vault | Admission denials, flow logs |
 | Theft of a GitHub App key | Key kept out of runner namespaces; separate Apps per org and environment; scheduled rotation | Unexpected runner registrations in the GitHub audit log; Key Vault reads |
 | Rogue runner picking up prod deploy jobs | Deploy groups limited to approved workflows; environment reviewers | Any runner registered in a deploy group outside the prod or DR scale sets |
-| Lateral movement into shared services | Runner subnet NSG; node pools tainted both ways; default-deny network policy | VNet and Cilium flow logs |
+| Lateral movement into shared services | Runner subnet NSG; node pools tainted both ways; default-deny network policy | VNet flow logs; container network logs if enabled |
 | Stealing the node's managed identity | Metadata endpoint and WireServer blocked; kubelet identity limited to ACR pulls | Flow logs, runtime detection |
 | Data exfiltration | Firewall FQDN allowlist; package proxy; no route to internal networks from build runners | Firewall denials; upload volume per runner |
-| Poisoned runner, job or package image | Signed images from the platform ACR only, pinned by digest; scanning; package proxy | Vulnerability findings, admission denials |
+| Poisoned runner, job or package image | Images only from the platform ACR, pinned by digest and signed by the pipeline; scanning; package proxy | Vulnerability findings, admission denials |
 | Resource abuse: crypto-mining, or a burst starving shared services | Quotas, NodePool CPU caps, lowest PriorityClass, `activeDeadlineSeconds` | Runtime detection, NodePool CPU alert |
-| Secrets leaking into logs | GitHub masking, gateway masking, per-org log access | SIEM rules for credential patterns in job logs |
+| Secrets leaking into logs | GitHub masking, exporter masking, per-org log access | SIEM rules for credential patterns in job logs |
 | Admin misuse or a bad change | Just-in-time admin through PIM; changes by PR; policy tests in CI | Kubernetes audit log, Entra ID logs |
 | Tampering with deploy workflows | Approved reusable workflows; CODEOWNERS and rulesets on workflow files; protected branches | GitHub audit log |
+
+### Admission policy
+
+Three layers check every pod in a runner namespace. The first two are built into the Kubernetes API server, so they need no add-on and fail closed.
+
+| Layer | What it enforces | Why this layer |
+| --- | --- | --- |
+| Pod Security Admission at the `restricted` level, set by namespace label | Non-root, no privilege escalation, all capabilities dropped, seccomp, no host namespaces or host paths | Built in; no policy code to write |
+| ValidatingAdmissionPolicy (CEL), managed by Terraform ([docs](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/)) | The org's own node selector and toleration on every pod, and no other org's; no `spec.nodeName`; images only from the platform ACR, pinned by digest; the Kata runtime class in `-docker` namespaces; resource limits and `activeDeadlineSeconds`; no Azure Policy ignore label on runner namespaces | Runs inside the API server and fails closed. It reads the namespace's `gh-org` label, so one policy covers every org. |
+| Azure Policy add-on (Gatekeeper) ([docs](https://learn.microsoft.com/en-us/azure/governance/policy/concepts/policy-for-kubernetes)) | The enterprise's Kubernetes baseline initiative and the built-in allowed-images policy, in deny mode | Managed by AKS, and reports compliance to Azure Policy for audit |
+
+What to plan for:
+
+- **The policies don't change pods.** The ARC Helm values and the container hook template set the node selector, toleration and security context; admission policy only rejects. A wrong template shows up as a failed job, not a pod quietly placed on the wrong nodes.
+- **Gatekeeper can fail open.** Upstream Gatekeeper's webhooks default to `failurePolicy: Ignore`, which admits pods while the webhook is down ([chart defaults](https://images.chainguard.dev/directory/community-chart/gatekeeper/defaultValues)). Check the add-on's setting in the pilot. Isolation doesn't depend on it, because the first two layers fail closed.
+- **Azure Policy changes take up to 15 minutes.** The add-on checks for assignment changes and rescans the cluster every 15 minutes. Onboarding an org needs no new assignment, because the placement policy reads the namespace label.
+- **Custom Rego can't read namespace labels.** Custom Azure Policy definitions can't use Gatekeeper's data sync, which is why the placement rules are ValidatingAdmissionPolicy. Azure Policy also accepts custom CEL policies, so the rules can move into Azure Policy later if the enterprise wants every rule there.
+- **The ignore label.** The add-on doesn't deny in a namespace that carries its ignore label. Only Terraform can label runner namespaces, and the ValidatingAdmissionPolicy rejects that label on them.
 
 ### Namespaces
 
 - One namespace per org, plus a `-docker` namespace for orgs with Docker jobs, created only from a template. The template adds:
   - the label `gh-org=<org>`
-  - Pod Security `restricted`; `privileged` only on the `-docker` namespace, where Kyverno requires Kata
+  - Pod Security `restricted`; `privileged` only on the `-docker` namespace, where admission policy requires Kata
   - default-deny network policy
   - ResourceQuota (CPU, memory, ephemeral storage, pod count) and LimitRange defaults
 - No human write access. The runner service account gets only what the container hooks need, in its own namespace.
 
 ### Pods
 
-- Kyverno injects the org's node selector and toleration into every pod, including job pods created by the hooks.
+- The Helm values and the hook template set the org's node selector and toleration on every pod, including job pods created by the hooks. Admission policy rejects any pod without them.
 - Deny:
   - other orgs' tolerations, and the shared services' tolerations
   - `spec.nodeName`, which bypasses taints entirely
@@ -237,7 +280,7 @@ Runners run untrusted code from every onboarded repo, so security is layered: ea
 
 - `runAsNonRoot`, `allowPrivilegeEscalation: false`, all capabilities dropped, seccomp `RuntimeDefault`.
 - The runner container's root filesystem is read-only, with `emptyDir` volumes for `_work` and `/tmp`.
-- Job containers come from workflows, not the Helm chart, so they get the same settings through the hook extension template, and Kyverno enforces them.
+- Job containers come from workflows, not the Helm chart, so they get the same settings through the hook extension template, and admission policy enforces them.
 - Only the `dind` sidecar may be privileged, and only inside Kata.
 - Many public job images (node, python) run as root, which `restricted` rejects. Publish non-root job images in ACR, or allow root only in Kata namespaces.
 
@@ -271,7 +314,7 @@ Also:
 
 ### Images and supply chain
 
-- Runner pods run only signed images from the platform ACR, referenced by digest.
+- Runner and job pods run only images from the platform ACR, referenced by digest. The pipeline signs each image and verifies the signature before promotion; signature checks at admission wait for AKS Image Integrity to support deny.
 - Job and service images come only from the platform ACR ([Golden image](#golden-image-and-os-lifecycle)).
 - Packages (npm, pip, Maven, NuGet) come only through an internal proxy such as Artifactory or Azure Artifacts, and the firewall blocks public registries. That stops dependency-confusion attacks and gives one place to block a bad package.
 - Enterprise Actions policy allows only approved actions and requires pinning them to a commit SHA ([changelog](https://github.blog/changelog/2025-08-15-github-actions-policy-now-supports-blocking-and-sha-pinning-actions/)).
@@ -302,7 +345,7 @@ Also:
 - **Images:** scanned at build, then continuously in ACR and while running by Defender for Containers ([docs](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-for-containers-introduction)). A new critical CVE triggers a rebuild; the weekly rebuild keeps the rest within the enterprise's CVE SLA.
 - **Nodes and Kubernetes:** weekly node images and the cluster auto-upgrade channel keep both in support ([Node OS](#node-os-owned-by-aks)).
 - **Posture:** Defender for Cloud recommendations and the CIS Kubernetes benchmark are tracked per cluster. Azure Policy enforces the Azure side: diagnostic settings, private endpoints, no public IPs on runner nodes, customer-managed keys.
-- **Policy tests:** every Kyverno change runs its test suite in CI, and the guardrail tests from the rollout run again after every cluster or ARC upgrade.
+- **Policy tests:** every policy change is tested in CI against a test cluster, with sample pods that must be admitted and others that must be rejected. The guardrail tests from the rollout run again after every cluster or ARC upgrade.
 - **Penetration test:** an independent test before prod deploy runners go live, then yearly. It covers container escape, cross-org access, metadata access, exfiltration and rogue runner registration.
 
 ### GitHub settings
@@ -318,8 +361,8 @@ Also:
 
 ### Detection and response
 
-- Defender for Containers on runc nodes, plus Falco or Tetragon for syscall-level alerts: shells in runner pods, crypto-mining, metadata-endpoint calls and unusual egress. Defender doesn't assess Kata pods, so Kata pools rely on the VM boundary plus audit and flow logs.
-- Firewall and Cilium flow logs go to the SIEM.
+- The Defender for Containers sensor, enabled through the AKS security profile ([docs](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-for-containers-enable-plan)), raises runtime alerts on runc nodes, such as shells in runner pods, crypto-mining and suspicious processes or network activity. It can't see inside Kata pod VMs, so Kata pools rely on the VM boundary plus audit and flow logs. Falco or Tetragon could add syscall-level rules later, at the cost of running them.
+- Firewall and VNet flow logs go to the SIEM, plus container network logs if they're turned on.
 - Each org's runner logs are readable only by that org and the platform team, since logs can contain secrets that masking missed.
 - IP addresses are turned on in the enterprise audit log, so investigations can see where human actions came from ([docs](https://docs.github.com/en/enterprise-cloud@latest/admin/monitoring-activity-in-your-enterprise/reviewing-audit-logs-for-your-enterprise/displaying-ip-addresses-in-the-audit-log-for-your-enterprise)).
 - A tested quarantine runbook: set the org's scale sets to 0, cordon its node pool, rotate its GitHub App key, then review audit and flow logs.
@@ -330,8 +373,8 @@ SIEM detections to build before the pilot, triaged by Arctic Wolf and owned by s
 | --- | --- |
 | A runner registered in a deploy group outside the prod or DR scale sets | GitHub audit log |
 | A change to runner groups, Actions policies, or a runner App's permissions or installations | GitHub audit log |
-| A shell, miner or unexpected binary in a runner or job pod | Falco or Tetragon, Defender |
-| A pod calling the metadata endpoint, WireServer or a shared-service subnet | Cilium and VNet flow logs, runtime detection |
+| A shell, miner or unexpected binary in a runner or job pod | Defender for Containers |
+| A pod calling the metadata endpoint, WireServer or a shared-service subnet | Firewall and VNet flow logs, container network logs if enabled |
 | Denied egress, or an upload spike from one runner | Azure Firewall logs |
 | A GitHub App key read by any identity other than ARC's | Key Vault logs |
 | A change in `arc-system`, admission webhooks or policies outside a change window | Kubernetes audit log |
@@ -339,40 +382,44 @@ SIEM detections to build before the pilot, triaged by Arctic Wolf and owned by s
 
 ## Logging and audit
 
-![Logging pipeline: job logs from GitHub's API and pod logs go through an OpenTelemetry collector gateway; GitHub audit events and Azure logs go through Event Hubs; both feed Dynatrace, Splunk, Elastic and Arctic Wolf](images/logging.png)
+![Logging pipeline: the Container insights add-on and a job-log exporter feed Azure Event Hubs alongside GitHub audit events and Azure logs; Dynatrace, Splunk, Elastic and Arctic Wolf read from Event Hubs](images/logging.png)
 
-Each log class has one collection path and one routing layer, and every tool reads from that layer. Adding or replacing a tool means one more exporter or Event Hubs consumer group, not another agent on the nodes.
+Every log class lands in Azure Event Hubs, and every tool reads from Event Hubs with its own consumer group. Pod logs are collected by the Container insights add-on, so the only log component the platform team runs is a small job-log exporter. Adding or replacing a tool means one more consumer group, not another agent on the nodes.
 
 **Job output never reaches the cluster.** In both Kubernetes container modes the runner streams each step's output straight to GitHub, so pod logs hold only the runner's own diagnostics. Job execution logs have to be pulled from GitHub's API after each job.
 
 | Log class | Source | How it's collected |
 | --- | --- | --- |
-| Job execution logs | Step output stored by GitHub | A job-log exporter in each cluster takes workflow run completions from the audit log stream, lists the run's jobs and downloads each job's log through the REST API. The download link is valid for 1 minute ([docs](https://docs.github.com/en/rest/actions/workflow-jobs)). It uses its own read-only GitHub App per org, never a runner App. |
-| Runner and platform logs | Runner diagnostics (the stock image sets `ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1`), ARC controller and listeners, Kyverno, Falco | A node collector DaemonSet reads container logs and adds pod metadata |
+| Job execution logs | Step output stored by GitHub | A job-log exporter in each cluster takes workflow run completions from the audit log stream, lists the run's jobs and downloads each job's log through the REST API; the download link is valid for 1 minute ([docs](https://docs.github.com/en/rest/actions/workflow-jobs)). It tags each log with org, repo, run, job, runner name and environment, masks known secret patterns, and sends it to Event Hubs. It uses its own read-only GitHub App per org, never a runner App. |
+| Runner and platform logs | Runner diagnostics (the stock image sets `ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1`), ARC controller and listeners, External Secrets | The Container insights add-on writes them to the `ContainerLogV2` table in Log Analytics ([docs](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/container-insights-logging-v2)), collecting only runner and platform namespaces, on the Basic plan. A workspace data export rule streams the table to Event Hubs ([docs](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/logs-data-export)). |
 | GitHub audit events | Enterprise audit log: runner registration and removal, runner groups, policy and settings changes, App and token use, workflow runs | Enterprise audit log streaming to Azure Event Hubs ([docs](https://docs.github.com/en/enterprise-cloud@latest/admin/monitoring-activity-in-your-enterprise/reviewing-audit-logs-for-your-enterprise/streaming-the-audit-log-for-your-enterprise)) |
-| Azure and cluster security logs | AKS control plane (`kube-audit-admin`, `karpenter-events`), Azure Activity log, Key Vault, Azure Firewall, VNet and Cilium flow logs, Entra ID sign-ins and PIM, Defender alerts | Diagnostic settings (Defender: continuous export) to Event Hubs, enforced by Azure Policy; Log Analytics too, where Azure Monitor alerts need it |
-| CI traces (optional) | GitHub `workflow_run` and `workflow_job` webhooks | The OpenTelemetry GitHub receiver, behind a webhook endpoint on the enterprise WAF. The receiver is alpha ([source](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/githubreceiver)). |
+| Azure and cluster security logs | AKS control plane (`kube-audit-admin`, `karpenter-events`), Azure Activity log, Azure Policy, Key Vault, Azure Firewall, VNet flow logs, container network logs if enabled, Entra ID sign-ins and PIM, Defender alerts | Diagnostic settings (Defender: continuous export) to Event Hubs, enforced by Azure Policy; Log Analytics too, where Azure Monitor alerts need it |
+| CI traces (optional) | GitHub `workflow_run` and `workflow_job` webhooks | The OpenTelemetry GitHub receiver, behind a webhook endpoint on the enterprise WAF; the only collector this design would run itself. The receiver is alpha ([source](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/githubreceiver)). |
 
-The OpenTelemetry collector gateway runs as 2 or more replicas on the system pool, the only path for pod and job logs to leave the cluster. It tags every record with org, repo, run, job, runner name and environment; drops debug noise; masks known secret patterns; and keeps one retry queue per tool, so a slow tool doesn't block the others. Event Hubs holds audit and Azure logs for its retention window, so a tool outage of a few hours loses nothing, and Event Hubs Capture writes a low-cost archive copy to storage.
+Event Hubs has one hub per log class and one consumer group per tool, per environment. It holds events for its retention window, so a tool outage of a few hours loses nothing, and Event Hubs Capture writes a low-cost archive copy to storage.
 
-| Tool | Cluster and job logs | GitHub audit and Azure logs |
-| --- | --- | --- |
-| Dynatrace | OTLP from the gateway | Dynatrace's Azure log forwarding from Event Hubs ([docs](https://docs.dynatrace.com/docs/ingest-from/microsoft-azure-services/ingest-telemetry/azure-logs-and-events/azure-logs)) |
-| Splunk | HEC from the gateway, as in the Splunk OpenTelemetry Collector for Kubernetes ([docs](https://help.splunk.com/en/splunk-cloud-platform/get-started/splunk-validated-architectures/getting-data-in-forwarding-and-preprocessing/splunk-opentelemetry-collector-for-kubernetes)) | Event Hub input of the Splunk Add-on for Microsoft Cloud Services ([docs](https://docs.splunk.com/Documentation/AddOns/latest/MSCloudServices/Configureeventhubs)) |
-| Elastic | OTLP or the Elasticsearch exporter from the gateway | Azure Event Hub input integration ([docs](https://www.elastic.co/docs/reference/integrations/azure/eventhub)) |
-| Arctic Wolf | Syslog over TLS on port 6514 from the gateway, through an Arctic Wolf sensor (vLC) in Azure ([docs](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/syslog-forwarding/syslog-integrations/configure-generic-syslog-configuration)) | Arctic Wolf's Microsoft Azure integration ([docs](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/cloud-detection-and-response-integrations/configure-microsoft-azure)); GitHub audit events by syslog from the gateway, unless Arctic Wolf confirms a direct GitHub feed |
-| Others | Any OpenTelemetry exporter | A new Event Hubs consumer group |
+| Tool | Reads Event Hubs through |
+| --- | --- |
+| Dynatrace | Dynatrace's Azure log forwarding ([docs](https://docs.dynatrace.com/docs/ingest-from/microsoft-azure-services/ingest-telemetry/azure-logs-and-events/azure-logs)) |
+| Splunk | The Event Hub input of the Splunk Add-on for Microsoft Cloud Services ([docs](https://docs.splunk.com/Documentation/AddOns/latest/MSCloudServices/Configureeventhubs)) |
+| Elastic | The Azure Event Hub input integration ([docs](https://www.elastic.co/docs/reference/integrations/azure/eventhub)) |
+| Arctic Wolf | Its Microsoft Azure integration ([docs](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/cloud-detection-and-response-integrations/configure-microsoft-azure)). For hubs it can't read, such as GitHub audit events, a small forwarder sends them as syslog over TLS on port 6514 to an Arctic Wolf sensor (vLC) in Azure ([docs](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/syslog-forwarding/syslog-integrations/configure-generic-syslog-configuration)). |
+| Others | A new consumer group |
 
 Rules for every log class:
 
-- **Correlation:** a job's `runner_name` is its runner pod's name, so one query joins the job log to the pod's logs, Falco alerts and, through the pod IP, firewall flows.
-- **Separation:** each org reads only its own job and runner logs, and nonprod and prod go to separate indexes. Job logs can hold secrets that masking missed, so access is as tight as the repo's.
+- **Correlation:** a job's `runner_name` is its runner pod's name (`PodName` in `ContainerLogV2`), so one query joins the job log to the pod's logs and Defender alerts. Each runner node belongs to one org, so firewall and VNet flow records map to an org by node IP.
+- **Separation:** each org reads only its own job and runner logs in the tools, and nonprod and prod go to separate indexes. Log Analytics keeps container logs for a short time, readable by the platform team only. Job logs can hold secrets that masking missed, so access is as tight as the repo's.
 - **Retention:** GitHub keeps job logs 90 days by default, settable from 1 to 400 days for private and internal repos ([docs](https://docs.github.com/en/enterprise-cloud@latest/organizations/managing-organization-settings/configuring-the-retention-period-for-github-actions-artifacts-and-logs-in-your-organization)). Since Oct 1, 2026 the same setting also deletes checks, workflow runs and statuses ([changelog](https://github.blog/changelog/2026-10-01-actions-retention-now-covers-checks-runs-and-statuses)), so the tools and the archive, not GitHub, are the long-term record. Each tool's retention follows the enterprise's policy for that log class.
-- **Cost:** job logs are the largest volume. Send them in full to one search tool and send the others job metadata and failed-job logs only.
-- **Integrity:** the archive is geo-redundant. If audit policy requires tamper-proof records, it also gets a time-based immutability (WORM) policy; confirm in the pilot that Event Hubs Capture writes to it. Changes to diagnostic settings or Event Hubs raise an alert from the Activity log.
-- **Egress:** only the gateway, the job-log exporter and the vLC send logs out of Azure. Their destinations are allowlisted on the firewall, or reached by Private Link where the tool offers it. Runner pods have no route to the tools.
+- **Cost:** job logs are the largest volume and skip Log Analytics entirely. Send them in full to one search tool, and send the others job metadata and failed-job logs only. Container logs pay Log Analytics Basic ingestion plus the data export meter; they stay small because job output isn't in them.
+- **Integrity:** the archive is geo-redundant. If audit policy requires tamper-proof records, it also gets a time-based immutability (WORM) policy; confirm in the pilot that Event Hubs Capture writes to it. Changes to diagnostic settings, data export rules or Event Hubs raise an alert from the Activity log.
+- **Egress:** nothing in the clusters sends logs out of Azure. The Azure Monitor agents use Azure Monitor Private Link Scope, and the exporter reaches Event Hubs through a private endpoint. The tools pull from Event Hubs, which accepts only their published IP ranges or Private Link. Runner pods have no route to the tools.
 
-**Confirm in the pilot:** GitHub lists workflow run completions as API-only audit events on the Enterprise plan ([changelog](https://github.blog/changelog/2021-02-23-github-actions-workflow-run-events-are-now-included-in-the-audit-log/)). If they don't arrive through the stream, the exporter polls the enterprise audit log API for them instead.
+**Confirm in the pilot:**
+
+- GitHub lists workflow run completions as API-only audit events on the Enterprise plan ([changelog](https://github.blog/changelog/2021-02-23-github-actions-workflow-run-events-are-now-included-in-the-audit-log/)). If they don't arrive through the stream, the exporter polls the enterprise audit log API for them instead.
+- `ContainerLogV2` exports to Event Hubs: it isn't on data export's unsupported list, but test it.
+- Dynatrace parses the job-log and GitHub audit hubs, and Arctic Wolf confirms which hubs it can read directly.
 
 ## Resilience and disaster recovery
 
@@ -384,7 +431,7 @@ Runners hold no state: a job's pod, workspace and node are gone when it ends, an
 | RTO, prod deploy runners | Minutes | A deploy or rollback may be needed during the same incident |
 | RTO, nonprod CI | Hours, well under 24 | GitHub cancels a self-hosted job that has waited 24 hours for a runner ([docs](https://docs.github.com/en/actions/reference/limits)) |
 
-**Within a region:** the system pool and runner NodePools span availability zones, and ACR, Key Vault and Event Hubs are zone-redundant. A lost node fails only the jobs on it. The ARC controller and listeners restart on another system node, and queued jobs wait in GitHub meanwhile. The collector gateway's replicas are spread across zones.
+**Within a region:** the system pool and runner NodePools span availability zones, and ACR, Key Vault and Event Hubs are zone-redundant. A lost node fails only the jobs on it. The ARC controller and listeners restart on another system node, and queued jobs wait in GitHub meanwhile.
 
 **Regional outage:**
 
@@ -400,14 +447,14 @@ Ready in the DR region before it's needed:
 
 - An ACR geo-replica with the golden images (Premium tier) ([docs](https://learn.microsoft.com/en-us/azure/container-registry/container-registry-geo-replication))
 - A Key Vault per org with the same App keys, kept in step by the key-rotation pipeline
-- Event Hubs, the collector gateway and the job-log exporter, so logs and audit keep flowing
+- Event Hubs, a Log Analytics workspace with its data export rule, and the job-log exporter, so logs and audit keep flowing
 - Firewall rules, NSGs, private DNS and private endpoints from the same IaC, and vCPU quota for the NodePools' `limits.cpu`
 
 What must survive a regional outage, and how it's protected. The clusters themselves hold nothing to back up, so runners need no Velero or AKS Backup:
 
 | Item | Where it lives | Protection |
 | --- | --- | --- |
-| Terraform, Helm values, Kyverno policies | Git | Branch protection and review |
+| Terraform, Helm values, admission policies | Git | Branch protection and review |
 | Terraform state | Azure Storage | Geo-redundant account with versioning, soft delete and a delete lock |
 | Runner and job images | ACR | Geo-replica in the DR region; the pipeline can rebuild them |
 | GitHub App keys | Key Vault | Soft delete and purge protection, plus a DR-region vault; a lost key is replaced by generating a new one in GitHub |
@@ -429,8 +476,8 @@ A drill twice a year proves it: scale the primary prod deploy scale sets to 0, r
 
 The platform is judged on four numbers: time for a job to start, failed runners, idle spend per org, and policy violations.
 
-- **Metrics:** enable ARC metrics on the controller and listeners. The collector gateway scrapes them, with Kyverno's and its own, and sends them to Dynatrace, the enterprise's monitoring tool ([docs](https://docs.dynatrace.com/docs/ingest-from/opentelemetry/getting-started/metrics/ingest/metrics-via-otel-collector)). Key series: `gha_job_startup_duration_seconds`, `gha_assigned_jobs` against `gha_desired_runners`, and `gha_controller_failed_ephemeral_runners` ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)). Azure Managed Prometheus and Grafana remain an option if the enterprise prefers an Azure-native stack.
-- **Cluster agents:** if the enterprise already runs the Dynatrace Operator on the shared clusters, it supplies node and cluster metrics. Exclude runner namespaces from OneAgent code-module injection, since job pods run untrusted, short-lived code.
+- **Metrics:** enable ARC metrics on the controller and listeners. The Managed Prometheus add-on scrapes them through PodMonitor resources ([docs](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-scrape-crd)) into an Azure Monitor workspace, with dashboards in Azure Managed Grafana and Prometheus alert rules sending alerts through Azure Monitor action groups. Key series: `gha_job_startup_duration_seconds`, `gha_assigned_jobs` against `gha_desired_runners`, and `gha_controller_failed_ephemeral_runners` ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)).
+- **Dynatrace:** if the enterprise already runs the Dynatrace Operator on the shared clusters, it can scrape the same ARC endpoints, so Dynatrace shows the runner platform beside everything else. Exclude runner namespaces from OneAgent code-module injection, since job pods run untrusted, short-lived code.
 - **Logs:** controller, listener, runner and job logs follow [Logging and audit](#logging-and-audit), each with a retention policy, as GitHub advises. NAP events come from the `karpenter-events` control plane log category ([docs](https://learn.microsoft.com/en-us/azure/aks/use-node-auto-provisioning)).
 - **Synthetic canary:** a scheduled workflow in a platform repo runs a tiny job on the platform scale set every 30 minutes in each cluster, and on each org's scale sets once a day. It checks the whole path (GitHub, listener, node, image, egress) and catches what metrics miss, such as an expired App key or a firewall change. In prod the canary is an approved deploy workflow that deploys nothing. More frequent canaries on org scale sets would keep their nodes awake and cost money.
 - **Dashboards:** per org (jobs, start time, failures, spend), platform (controller, listeners, NodePools against their caps, vCPU quota, subnet IPs, log pipeline) and security (detections, admission denials).
@@ -453,7 +500,7 @@ Starting alerts, to tune after a month of baseline:
 | Canary | Fails, or misses the start-time target, twice in a row | Walk the path: listener, node, image pull, egress |
 | Runtime detection | Any high-severity alert in a runner namespace | Run the quarantine runbook |
 | Runner in a deploy group | Registered by anything other than the prod or DR deploy scale sets | Remove the runner, rotate the org's Apps, run the quarantine runbook |
-| Log pipeline | A tool's retry queue keeps growing, or an org with running jobs sends no job logs for an hour | Check the tool's endpoint and the exporter's GitHub App |
+| Log pipeline | A tool's consumer group falls behind, or an org with running jobs sends no job logs for an hour | Check the tool's connector and the exporter's GitHub App |
 | Policy violations | Any denied admission in a runner namespace | Find the source; fix the template or the workflow |
 | Job start time, p95 | Above the agreed target for 15 min | Check node provisioning and image pull |
 | Failed ephemeral runners | Non-zero for 15 min | Check image, GitHub App key, quota |
@@ -492,14 +539,16 @@ These decisions shape the build; the recommendation column is the default if no 
 | Prod deploy DR | Rebuild; warm standby, active-active or held at `maxRunners: 0`; GitHub-hosted | Warm standby; active-active only if deploy targets are reachable from both regions |
 | CI during a regional outage | Wait for the rebuild; GitHub-hosted with private networking | Rebuild, plus GitHub-hosted for a short list of critical repos |
 | Where full job logs go | One search tool; every tool | One search tool (Splunk or Elastic); metadata and failed-job logs to the rest |
-| GitHub audit events to Arctic Wolf | Syslog from the gateway; a direct Arctic Wolf feed | Syslog, unless Arctic Wolf confirms a direct feed |
-| Metrics and alerting home | Dynatrace; Azure Managed Prometheus and Grafana | Dynatrace, the enterprise's monitoring tool |
+| Hubs Arctic Wolf can't read directly | A small Event Hubs-to-syslog forwarder; a direct Arctic Wolf feed | The forwarder, unless Arctic Wolf confirms a direct feed |
+| Metrics and alerting home | Managed Prometheus and Grafana (AKS add-on); Dynatrace | Managed Prometheus for platform metrics and alerts; Dynatrace shows them too if the enterprise's operator scrapes ARC |
+| Container network logs | Off; on | Off at first: VNet and firewall logs map flows to an org by node. Turn on if security wants per-pod flows and accepts the charge, which covers every node in the shared cluster |
+| Image signature check at admission | Wait for AKS Image Integrity to support deny; run Ratify ourselves | Wait, with digest-pinned images from the platform ACR meanwhile |
 | Service-level targets | The proposals in Monitoring and operations | Agree after a month of pilot data |
 | Enterprise IP allow list | Off; on, with the firewall's egress IPs allowed for the runner Apps | Evaluate with security. A stolen App key would stop working outside the allowed IPs, but the list applies to every user and integration in the enterprise ([docs](https://docs.github.com/en/enterprise-cloud@latest/apps/maintaining-github-apps/managing-allowed-ip-addresses-for-a-github-app)) |
 
 Rollout:
 
-1. **Nonprod foundation:** on the nonprod cluster, the runner subnet and NSG, runner node pools, Kyverno and its policies, ACR, Key Vault, ARC controller, platform scale set and image pipeline, plus the log pipeline: audit log streaming, Event Hubs, the collector gateway and the job-log exporter. Exit: guardrail tests pass, the pipeline builds the golden image on its own runners, and job logs and audit events reach every tool. The tests show:
+1. **Nonprod foundation:** on the nonprod cluster, the runner subnet and NSG, runner node pools, the admission policies (Pod Security labels, ValidatingAdmissionPolicy, Azure Policy assignments), the Defender, Container insights and Managed Prometheus add-ons, ACR, Key Vault, ARC controller, platform scale set and image pipeline, plus the log pipeline: audit log streaming, Event Hubs, the data export rule and the job-log exporter. Exit: guardrail tests pass, the pipeline builds the golden image on its own runners, and job logs and audit events reach every tool. The tests show:
    - a pod without the org's toleration is rejected
    - a job can't reach the metadata endpoint or a shared service
    - a runner pod can't read the GitHub App credential
@@ -509,7 +558,7 @@ Rollout:
 4. **Docker tier:** Kata pool and `dind` scale set, plus a security review. Exit: `docker build` works in the sandbox and a container-escape test fails.
 5. **Prod deploy runners and DR standby:** the pilot org's deploy scale set in the prod cluster, its runner group limited to approved workflows, the DR-region standby and the deploy-group alert. Exit: a deploy runs behind an environment approval, a failover drill deploys from the DR region, and the penetration test's findings are fixed.
 6. **Remaining orgs:** onboarded by template PR, with showback by namespace.
-7. **Hardening:** signed-image enforcement on, runtime detection and alerts tuned, and the quarantine runbook and DR drill tested.
+7. **Hardening:** image policy in deny mode, runtime detection and alerts tuned, and the quarantine runbook and DR drill tested.
 
 ## Sources
 
@@ -542,13 +591,20 @@ Rollout:
 - [About Azure private networking for GitHub-hosted runners in your enterprise](https://docs.github.com/en/enterprise-cloud@latest/admin/configuring-settings/configuring-private-networking-for-hosted-compute-products/about-azure-private-networking-for-github-hosted-runners-in-your-enterprise) (GitHub Docs)
 - [GitHub receiver](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/githubreceiver) (OpenTelemetry Collector contrib)
 - [Azure logs](https://docs.dynatrace.com/docs/ingest-from/microsoft-azure-services/ingest-telemetry/azure-logs-and-events/azure-logs) (Dynatrace Docs)
-- [Splunk OpenTelemetry Collector for Kubernetes](https://help.splunk.com/en/splunk-cloud-platform/get-started/splunk-validated-architectures/getting-data-in-forwarding-and-preprocessing/splunk-opentelemetry-collector-for-kubernetes) (Splunk Validated Architectures)
 - [Configure Azure Event Hub inputs for the Splunk Add-on for Microsoft Cloud Services](https://docs.splunk.com/Documentation/AddOns/latest/MSCloudServices/Configureeventhubs) (Splunk Docs)
 - [Azure Event Hub Input](https://www.elastic.co/docs/reference/integrations/azure/eventhub) (Elastic Docs)
 - [Microsoft Azure monitoring](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/cloud-detection-and-response-integrations/configure-microsoft-azure) (Arctic Wolf Docs)
 - [Configure a syslog server to send logs to Arctic Wolf](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/syslog-forwarding/syslog-integrations/configure-generic-syslog-configuration) (Arctic Wolf Docs)
 - [Displaying IP addresses in the audit log for your enterprise](https://docs.github.com/en/enterprise-cloud@latest/admin/monitoring-activity-in-your-enterprise/reviewing-audit-logs-for-your-enterprise/displaying-ip-addresses-in-the-audit-log-for-your-enterprise) (GitHub Docs)
 - [Managing allowed IP addresses for a GitHub App](https://docs.github.com/en/enterprise-cloud@latest/apps/maintaining-github-apps/managing-allowed-ip-addresses-for-a-github-app) (GitHub Docs)
-- [Send metrics via the OpenTelemetry Collector](https://docs.dynatrace.com/docs/ingest-from/opentelemetry/getting-started/metrics/ingest/metrics-via-otel-collector) (Dynatrace Docs)
 - [Overview of Container security in Microsoft Defender for Containers](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-for-containers-introduction) (Microsoft Learn)
 - [Azure Key Vault soft-delete overview](https://learn.microsoft.com/en-us/azure/key-vault/general/soft-delete-overview) (Microsoft Learn)
+- [Azure Policy for Kubernetes clusters](https://learn.microsoft.com/en-us/azure/governance/policy/concepts/policy-for-kubernetes) (Microsoft Learn)
+- [Validating Admission Policy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/) (Kubernetes docs)
+- [Gatekeeper chart default values](https://images.chainguard.dev/directory/community-chart/gatekeeper/defaultValues) (Chainguard)
+- [Image Integrity in AKS (preview)](https://learn.microsoft.com/en-us/azure/aks/image-integrity) (Microsoft Learn)
+- [Container network logs](https://learn.microsoft.com/en-us/azure/aks/container-network-observability-logs) (Microsoft Learn)
+- [Enable Defender for Containers](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-for-containers-enable-plan) (Microsoft Learn)
+- [Container insights log schema (ContainerLogV2)](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/container-insights-logging-v2) (Microsoft Learn)
+- [Log Analytics workspace data export](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/logs-data-export) (Microsoft Learn)
+- [Custom Prometheus scrape jobs with CRDs](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-scrape-crd) (Microsoft Learn)
