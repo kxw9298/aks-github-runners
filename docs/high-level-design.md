@@ -4,7 +4,7 @@ _As of Oct 18, 2026_
 
 ## Summary
 
-Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared AKS clusters, alongside the shared services: build and test runners in the nonprod cluster, and only tightly restricted deploy runners in the prod cluster. Runners are each cluster's least-trusted tenant. Each GitHub org gets its own GitHub App, namespace and tainted node pool, runner nodes sit in a subnet that can't reach the shared services, and admission policy enforces every rule. Runner pods and runner nodes scale to zero when no jobs are queued. Wherever AKS has an add-on or managed feature, the design uses it instead of running its own tool: admission policy, network policy, node scaling, sandboxing, runtime detection, logs and metrics. Azure Event Hubs carries every log class to Dynatrace, Splunk, Elastic and Arctic Wolf, and prod deploy runners keep a warm standby in a DR region.
+Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared AKS clusters, alongside the shared services: build and test runners in the nonprod cluster, and only tightly restricted deploy runners in the prod cluster. Runners are each cluster's least-trusted tenant. Each GitHub org gets its own GitHub App, namespace and tainted node pool, runner nodes sit in a subnet that can't reach the shared services, and admission policy enforces every rule. Runner pods and runner nodes scale to zero when no jobs are queued. AKS add-ons and managed features cover admission policy, network policy, node scaling and sandboxing. Dynatrace is the logging and observability platform, Prisma Cloud does runtime detection, and Arctic Wolf monitors security, with Azure Event Hubs carrying job logs, GitHub audit events and Azure logs to them. Prod deploy runners keep a warm standby in a DR region.
 
 | Requirement | How the design meets it |
 | --- | --- |
@@ -13,10 +13,10 @@ Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared
 | Production and non-production | Pull-request code runs only in the nonprod cluster. The prod cluster hosts only deploy runners, limited to approved workflows behind environment approvals. Platform changes reach nonprod first. |
 | Lowest spend when idle | `minRunners: 0` on every scale set; runner nodes are created on demand and removed when empty. The control plane and egress are already paid by the shared clusters, so the runner platform's idle cost is the ARC controller, its listeners and a share of registry, vault and logs. |
 | Golden image with OS lifecycle | Two layers, two owners. AKS patches the node OS weekly in a maintenance window. The platform team hardens, builds, scans, signs and promotes the runner pod image weekly and on every runner release. |
-| Logging and audit | Job logs, runner and platform logs, GitHub audit events and Azure security logs reach Dynatrace, Splunk, Elastic and Arctic Wolf through the Container insights add-on, a small job-log exporter and Azure Event Hubs. |
+| Logging and audit | Runner and platform logs reach Dynatrace through the Dynatrace Operator. Job logs, GitHub audit events and Azure security logs go through a small job-log exporter and Azure Event Hubs to Dynatrace, and the security events also to Arctic Wolf. |
 | Security | A threat model maps each threat to preventive controls and detections. Policy-enforced guardrails cover namespaces, pods, containers, network, credentials, images and GitHub settings, with SIEM detections and a tested quarantine runbook. |
-| Monitoring | ARC and cluster metrics in the Managed Prometheus add-on, with service-level targets, alerts routed to on-call and the SOC, and a synthetic canary job that proves each runner path end to end. |
-| Managed over self-run | AKS add-ons and managed features cover policy, networking, scaling, sandboxing, runtime detection, logs and metrics. The platform team runs only ARC, the job-log exporter and the Key Vault secret sync. |
+| Monitoring | ARC and cluster metrics, dashboards and alerts in Dynatrace, with service-level targets, alerts routed to on-call and the SOC, and a synthetic canary job that proves each runner path end to end. |
+| Managed over self-run | AKS add-ons and managed features cover policy, networking, scaling and sandboxing; the enterprise's Dynatrace and Prisma Cloud agents cover observability and runtime security. The platform team runs only ARC, the job-log exporter and the Key Vault secret sync. |
 | Disaster recovery | Runners hold no state, so recovery is the same Terraform and Helm in another cluster. Prod deploy runners keep a warm standby; CI can fall back to GitHub-hosted runners. |
 
 **Assumptions to confirm**
@@ -24,8 +24,8 @@ Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared
 - GitHub Enterprise Cloud, with several orgs under one enterprise.
 - Linux x64 jobs only in phase 1; Windows and Arm later, if at all.
 - Two shared enterprise AKS clusters, nonprod and prod, host the runners alongside the shared services. Separate runner clusters are ruled out, to limit the number of clusters to operate. GitHub recommends keeping production workloads off clusters that run runners, because jobs run arbitrary code ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)); [Production and non-production](#production-and-non-production) and [Sharing the cluster with enterprise services](#sharing-the-cluster-with-enterprise-services) cover how the design compensates.
-- Dynatrace, Splunk, Elastic and Arctic Wolf are the monitoring and security tools; others can be added the same way.
-- The shared clusters use Azure CNI Powered by Cilium for network policy, and the enterprise allows the Azure Policy, Defender, Container insights and Managed Prometheus add-ons on them.
+- Dynatrace is the logging and observability platform, Prisma Cloud the runtime security tool and Arctic Wolf the security monitoring service. Other tools, such as Splunk or Elastic, can be added the same way.
+- The shared clusters use Azure CNI Powered by Cilium for network policy and the Azure Policy add-on, and already run, or allow, the Dynatrace Operator and the Prisma Cloud Defender.
 - Whether the enterprise has a DR-region cluster for the shared services is still to be confirmed; the DR options cover both cases.
 - Some jobs build container images, so a Docker-capable tier is needed.
 
@@ -39,28 +39,29 @@ Each scale set's listener waits for jobs from the system pool. When a job is ass
 
 The diagrams are drawn in draw.io with the Azure icon set: edit [`images/architecture.drawio`](images/architecture.drawio) and [`images/logging.drawio`](images/logging.drawio), then export the PNGs.
 
-## AKS add-ons and managed features
+## AKS add-ons, managed features and enterprise tools
 
-Wherever AKS offers an add-on or managed feature, the design uses it, so Microsoft patches and supports that part. The platform team runs only what has no managed equivalent.
+Wherever AKS offers an add-on or managed feature, the design uses it, so Microsoft patches and supports that part. For observability and runtime security, the enterprise's own tools take that place, run by their owning teams. The platform team runs only what neither covers.
 
-| Need | AKS add-on or managed feature | Instead of |
+| Need | What provides it | Instead of |
 | --- | --- | --- |
 | Admission policy | Pod Security Admission and ValidatingAdmissionPolicy, both built into Kubernetes, plus the Azure Policy add-on (Gatekeeper) ([Admission policy](#admission-policy)) | Kyverno |
 | Network policy | Azure CNI Powered by Cilium | A self-installed Cilium or Calico |
 | Node scaling | Node auto-provisioning (NAP); the cluster autoscaler for Kata pools | Self-managed Karpenter |
 | Job sandbox | Pod Sandboxing (Kata) | Self-installed Kata or gVisor |
-| Runtime detection | Defender for Containers sensor, through the AKS security profile | Falco or Tetragon |
-| Pod logs | Container insights (Azure Monitor add-on), then a Log Analytics data export rule to Event Hubs ([Logging and audit](#logging-and-audit)) | An OpenTelemetry collector DaemonSet and gateway |
-| Metrics, dashboards and alerts | Managed Prometheus add-on, Azure Managed Grafana and Prometheus alert rules | A self-run Prometheus or collector |
+| Runtime detection and image scanning | Prisma Cloud Defender, the enterprise's runtime security tool ([docs](https://docs.prismacloud.io/content-collections/runtime-security/install/get-started)) | Defender for Containers, Falco or Tetragon |
+| Pod logs | The Dynatrace Operator's log module ([docs](https://docs.dynatrace.com/docs/ingest-from/setup-on-k8s/deployment/k8s-log-monitoring)) | Container insights with data export, or an OpenTelemetry collector |
+| Metrics, dashboards and alerts | Dynatrace, scraping ARC's Prometheus metrics through its ActiveGate ([docs](https://docs.dynatrace.com/docs/observe/infrastructure-observability/container-platform-monitoring/kubernetes-monitoring/monitor-prometheus-metrics)) | Managed Prometheus and Grafana |
 | Network flow logs (optional) | Container network logs, part of Advanced Container Networking Services (paid) ([docs](https://learn.microsoft.com/en-us/azure/aks/container-network-observability-logs)) | Self-run Hubble |
 | Patching, image cleanup, identity, secrets encryption, cost showback | Node OS and cluster auto-upgrade channels, Image Cleaner, workload identity, KMS etcd encryption, the cost analysis add-on | Scripts and cron jobs |
 
 Considered but not used yet:
 
 - **Image Integrity** checks image signatures at admission, but it is still preview and supports only the audit effect ([docs](https://learn.microsoft.com/en-us/azure/aks/image-integrity)), so it can't block an unsigned image. Until it can, admission policy allows only digest-pinned images from the platform ACR, only the image pipeline can push there, and the pipeline verifies each signature before promoting an image.
+- **Defender for Containers, Container insights and Managed Prometheus** would duplicate Prisma Cloud and Dynatrace, so they stay off. Container insights with data export to Event Hubs is the fallback if the Dynatrace Operator isn't allowed on runner nodes.
 - **Key Vault Secrets Provider add-on** syncs a Key Vault secret into a Kubernetes secret only while a pod in the same namespace mounts it. That would put a Key Vault identity in every runner namespace, so External Secrets Operator (as in the PoC) or ARC's built-in Key Vault mode does this job instead ([GitHub App credentials](#github-app-credentials)).
 
-Still run by the platform team, because no add-on exists: ARC (controller and listeners), the job-log exporter, External Secrets Operator, and the Arctic Wolf sensor VM and syslog forwarder.
+Still run by the platform team: ARC (controller and listeners), the job-log exporter and External Secrets Operator. The Dynatrace Operator, the Prisma Cloud Defender and the Arctic Wolf sensor and syslog forwarder are run by their owning teams.
 
 ## Production and non-production
 
@@ -117,7 +118,7 @@ Pick an isolation tier per org:
 
 A cluster per org is out of scope: the design runs on the shared nonprod and prod clusters.
 
-Kata limits to plan for: Azure Linux node pools only, a Gen2 VM size with nested virtualization, no Trusted Launch or FIPS on those pools, and no Defender for Containers assessment of Kata pods ([docs](https://learn.microsoft.com/en-us/azure/aks/use-pod-sandboxing)).
+Kata limits to plan for: Azure Linux node pools only, a Gen2 VM size with nested virtualization, no Trusted Launch or FIPS on those pools, and host-level security agents can't see inside Kata pods ([docs](https://learn.microsoft.com/en-us/azure/aks/use-pod-sandboxing)).
 
 **Shared trust point:** the ARC controller in `arc-system` serves every org and can read every org's GitHub App credential. Only platform admins may change anything in `arc-system`.
 
@@ -153,7 +154,7 @@ With no queued jobs, no runner pods and no runner nodes exist. Each shared clust
 | AKS control plane and egress | Cluster API; outbound control | Already paid by the shared cluster |
 | ARC controller and listeners | One controller; one listener per scale set, on the system pool | Tight requests on listeners; fewer, multi-label scale sets |
 | ACR, Key Vault, Event Hubs, Log Analytics | Images, GitHub App keys, log routing | Short retention on runner logs; purge old images; Event Hubs sized for peak with auto-inflate |
-| Add-on agents | Container insights, Managed Prometheus, Defender and Azure Policy run pods on the system pool, and node agents on every node, runner nodes included | Count the agents' requests when sizing runner VMs; Basic plan and short retention for container logs |
+| Agents | The Dynatrace Operator (log module and ActiveGate), the Prisma Cloud Defender and the Azure Policy add-on, with node agents on every node, runner nodes included | Count the agents' requests when sizing runner VMs; collect logs only from runner and platform namespaces |
 
 The trade-off is cold start: the first job after idle waits for a node to boot and the image to pull. Track it with `gha_job_startup_duration_seconds` and keep the runner image slim. Showback per org comes from namespace labels in the AKS cost analysis add-on.
 
@@ -203,7 +204,7 @@ The image pipeline:
 
 1. **Trigger:** a new runner release, a base-image digest change, the weekly schedule, or a critical CVE.
 2. **Build** in a platform repo, on a platform-only scale set.
-3. **Scan** with Trivy or Defender; fail on critical or high findings that have a fix.
+3. **Scan** with Prisma Cloud (`twistcli`) or Trivy; fail on critical or high findings that have a fix.
 4. **Sign and push:** SBOM, signature (Notation or cosign) and an immutable tag `<runner-version>-<yyyymmdd>` in ACR; record the digest.
 5. **Canary:** roll to the platform scale set and smoke-test a container job, a service container and a Kata Docker build.
 6. **Promote by ring:** a PR bumps the digest in Helm values; the deployment pipeline rolls out platform → pilot org → all orgs.
@@ -223,7 +224,7 @@ Runners run untrusted code from every onboarded repo, so security is layered: ea
 | Threat | Main controls | Detection |
 | --- | --- | --- |
 | Malicious code in a workflow, dependency or action | Ephemeral pods and nodes; restricted, non-root pods; no Azure identity on runners; egress allowlist; approved actions pinned by SHA; fork pull requests need approval | Runtime detection, firewall logs |
-| Container escape to the node | Node pool per org; Kata for Docker jobs; seccomp; no host access; daily node expiry | Runtime detection, Defender |
+| Container escape to the node | Node pool per org; Kata for Docker jobs; seccomp; no host access; daily node expiry | Prisma Cloud runtime alerts |
 | One org reaching another org's jobs, secrets or nodes | Per org: GitHub App, namespace, network policy, node pool and Key Vault | Admission denials, flow logs |
 | Theft of a GitHub App key | Key kept out of runner namespaces; separate Apps per org and environment; scheduled rotation | Unexpected runner registrations in the GitHub audit log; Key Vault reads |
 | Rogue runner picking up prod deploy jobs | Deploy groups limited to approved workflows; environment reviewers | Any runner registered in a deploy group outside the prod or DR scale sets |
@@ -342,9 +343,9 @@ Also:
 
 ### Vulnerability management and testing
 
-- **Images:** scanned at build, then continuously in ACR and while running by Defender for Containers ([docs](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-for-containers-introduction)). A new critical CVE triggers a rebuild; the weekly rebuild keeps the rest within the enterprise's CVE SLA.
+- **Images:** scanned at build, then continuously in ACR and on the nodes by Prisma Cloud. A new critical CVE triggers a rebuild; the weekly rebuild keeps the rest within the enterprise's CVE SLA.
 - **Nodes and Kubernetes:** weekly node images and the cluster auto-upgrade channel keep both in support ([Node OS](#node-os-owned-by-aks)).
-- **Posture:** Defender for Cloud recommendations and the CIS Kubernetes benchmark are tracked per cluster. Azure Policy enforces the Azure side: diagnostic settings, private endpoints, no public IPs on runner nodes, customer-managed keys.
+- **Posture:** Prisma Cloud compliance checks, including the CIS Kubernetes benchmark, are tracked per cluster. Azure Policy enforces the Azure side: diagnostic settings, private endpoints, no public IPs on runner nodes, customer-managed keys.
 - **Policy tests:** every policy change is tested in CI against a test cluster, with sample pods that must be admitted and others that must be rejected. The guardrail tests from the rollout run again after every cluster or ARC upgrade.
 - **Penetration test:** an independent test before prod deploy runners go live, then yearly. It covers container escape, cross-org access, metadata access, exfiltration and rogue runner registration.
 
@@ -361,7 +362,8 @@ Also:
 
 ### Detection and response
 
-- The Defender for Containers sensor, enabled through the AKS security profile ([docs](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-for-containers-enable-plan)), raises runtime alerts on runc nodes, such as shells in runner pods, crypto-mining and suspicious processes or network activity. It can't see inside Kata pod VMs, so Kata pools rely on the VM boundary plus audit and flow logs. Falco or Tetragon could add syscall-level rules later, at the cost of running them.
+- The Prisma Cloud Defender runs on every node and raises runtime alerts, such as shells in runner pods, crypto-mining, metadata-endpoint calls and unexpected egress, and sends them to the SOC through its alert integrations ([docs](https://docs.prismacloud.io/content-collections/runtime-security/alerts/alert-mechanism)). Every job runs different code, so detection uses explicit rules, not learned models. The Defender is privileged and tolerates the runner pools' taints; the security team runs it in its own namespace.
+- Host-level agents can't see inside Kata pod VMs, so Kata pools rely on the VM boundary plus audit and flow logs; confirm with Palo Alto.
 - Firewall and VNet flow logs go to the SIEM, plus container network logs if they're turned on.
 - Each org's runner logs are readable only by that org and the platform team, since logs can contain secrets that masking missed.
 - IP addresses are turned on in the enterprise audit log, so investigations can see where human actions came from ([docs](https://docs.github.com/en/enterprise-cloud@latest/admin/monitoring-activity-in-your-enterprise/reviewing-audit-logs-for-your-enterprise/displaying-ip-addresses-in-the-audit-log-for-your-enterprise)).
@@ -373,7 +375,7 @@ SIEM detections to build before the pilot, triaged by Arctic Wolf and owned by s
 | --- | --- |
 | A runner registered in a deploy group outside the prod or DR scale sets | GitHub audit log |
 | A change to runner groups, Actions policies, or a runner App's permissions or installations | GitHub audit log |
-| A shell, miner or unexpected binary in a runner or job pod | Defender for Containers |
+| A shell, miner or unexpected binary in a runner or job pod | Prisma Cloud runtime alerts |
 | A pod calling the metadata endpoint, WireServer or a shared-service subnet | Firewall and VNet flow logs, container network logs if enabled |
 | Denied egress, or an upload spike from one runner | Azure Firewall logs |
 | A GitHub App key read by any identity other than ARC's | Key Vault logs |
@@ -382,44 +384,44 @@ SIEM detections to build before the pilot, triaged by Arctic Wolf and owned by s
 
 ## Logging and audit
 
-![Logging pipeline: the Container insights add-on and a job-log exporter feed Azure Event Hubs alongside GitHub audit events and Azure logs; Dynatrace, Splunk, Elastic and Arctic Wolf read from Event Hubs](images/logging.png)
+![Logging pipeline: the Dynatrace Operator sends pod logs and metrics to Dynatrace; a job-log exporter, GitHub audit events and Azure logs go through Azure Event Hubs to Dynatrace and Arctic Wolf; Prisma Cloud raises runtime alerts](images/logging.png)
 
-Every log class lands in Azure Event Hubs, and every tool reads from Event Hubs with its own consumer group. Pod logs are collected by the Container insights add-on, so the only log component the platform team runs is a small job-log exporter. Adding or replacing a tool means one more consumer group, not another agent on the nodes.
+Dynatrace is the logging and observability platform: every log class ends up there. Pod logs and metrics go straight to it through the Dynatrace Operator. Job logs, GitHub audit events and Azure logs go through Azure Event Hubs, which also feeds Arctic Wolf and the archive. The only log component the platform team runs is a small job-log exporter.
 
 **Job output never reaches the cluster.** In both Kubernetes container modes the runner streams each step's output straight to GitHub, so pod logs hold only the runner's own diagnostics. Job execution logs have to be pulled from GitHub's API after each job.
 
 | Log class | Source | How it's collected |
 | --- | --- | --- |
 | Job execution logs | Step output stored by GitHub | A job-log exporter in each cluster takes workflow run completions from the audit log stream, lists the run's jobs and downloads each job's log through the REST API; the download link is valid for 1 minute ([docs](https://docs.github.com/en/rest/actions/workflow-jobs)). It tags each log with org, repo, run, job, runner name and environment, masks known secret patterns, and sends it to Event Hubs. It uses its own read-only GitHub App per org, never a runner App. |
-| Runner and platform logs | Runner diagnostics (the stock image sets `ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1`), ARC controller and listeners, External Secrets | The Container insights add-on writes them to the `ContainerLogV2` table in Log Analytics ([docs](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/container-insights-logging-v2)), collecting only runner and platform namespaces, on the Basic plan. A workspace data export rule streams the table to Event Hubs ([docs](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/logs-data-export)). |
+| Runner and platform logs | Runner diagnostics (the stock image sets `ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT=1`), ARC controller and listeners, External Secrets | The Dynatrace Operator's log module reads container logs on each node and sends them to Dynatrace, collecting only runner and platform namespaces ([docs](https://docs.dynatrace.com/docs/ingest-from/setup-on-k8s/deployment/k8s-log-monitoring)) |
 | GitHub audit events | Enterprise audit log: runner registration and removal, runner groups, policy and settings changes, App and token use, workflow runs | Enterprise audit log streaming to Azure Event Hubs ([docs](https://docs.github.com/en/enterprise-cloud@latest/admin/monitoring-activity-in-your-enterprise/reviewing-audit-logs-for-your-enterprise/streaming-the-audit-log-for-your-enterprise)) |
-| Azure and cluster security logs | AKS control plane (`kube-audit-admin`, `karpenter-events`), Azure Activity log, Azure Policy, Key Vault, Azure Firewall, VNet flow logs, container network logs if enabled, Entra ID sign-ins and PIM, Defender alerts | Diagnostic settings (Defender: continuous export) to Event Hubs, enforced by Azure Policy; Log Analytics too, where Azure Monitor alerts need it |
+| Azure and cluster security logs | AKS control plane (`kube-audit-admin`, `karpenter-events`), Azure Activity log, Azure Policy, Key Vault, Azure Firewall, VNet flow logs, container network logs if enabled, Entra ID sign-ins and PIM | Diagnostic settings to Event Hubs, enforced by Azure Policy |
+| Runtime security alerts | Prisma Cloud Defender on every node | The Prisma Cloud console, which sends alerts to the SOC through its alert integrations ([docs](https://docs.prismacloud.io/content-collections/runtime-security/alerts/alert-mechanism)) |
 | CI traces (optional) | GitHub `workflow_run` and `workflow_job` webhooks | The OpenTelemetry GitHub receiver, behind a webhook endpoint on the enterprise WAF; the only collector this design would run itself. The receiver is alpha ([source](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/githubreceiver)). |
 
 Event Hubs has one hub per log class and one consumer group per tool, per environment. It holds events for its retention window, so a tool outage of a few hours loses nothing, and Event Hubs Capture writes a low-cost archive copy to storage.
 
-| Tool | Reads Event Hubs through |
-| --- | --- |
-| Dynatrace | Dynatrace's Azure log forwarding ([docs](https://docs.dynatrace.com/docs/ingest-from/microsoft-azure-services/ingest-telemetry/azure-logs-and-events/azure-logs)) |
-| Splunk | The Event Hub input of the Splunk Add-on for Microsoft Cloud Services ([docs](https://docs.splunk.com/Documentation/AddOns/latest/MSCloudServices/Configureeventhubs)) |
-| Elastic | The Azure Event Hub input integration ([docs](https://www.elastic.co/docs/reference/integrations/azure/eventhub)) |
-| Arctic Wolf | Its Microsoft Azure integration ([docs](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/cloud-detection-and-response-integrations/configure-microsoft-azure)). For hubs it can't read, such as GitHub audit events, a small forwarder sends them as syslog over TLS on port 6514 to an Arctic Wolf sensor (vLC) in Azure ([docs](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/syslog-forwarding/syslog-integrations/configure-generic-syslog-configuration)). |
-| Others | A new consumer group |
+| Tool | Role | Gets |
+| --- | --- | --- |
+| Dynatrace | Logging and observability | Pod logs and metrics from the Dynatrace Operator; job logs, GitHub audit events and Azure logs from Event Hubs through its Azure log forwarding ([docs](https://docs.dynatrace.com/docs/ingest-from/microsoft-azure-services/ingest-telemetry/azure-logs-and-events/azure-logs)) |
+| Arctic Wolf | Security monitoring | Azure logs through its Microsoft Azure integration ([docs](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/cloud-detection-and-response-integrations/configure-microsoft-azure)). For hubs it can't read, such as GitHub audit events, a small forwarder sends them as syslog over TLS on port 6514 to an Arctic Wolf sensor (vLC) in Azure ([docs](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/syslog-forwarding/syslog-integrations/configure-generic-syslog-configuration)). Prisma Cloud alerts too. |
+| Prisma Cloud | Runtime security | Its own Defenders on every node |
+| Others, such as Splunk or Elastic | As needed | A new Event Hubs consumer group |
 
 Rules for every log class:
 
-- **Correlation:** a job's `runner_name` is its runner pod's name (`PodName` in `ContainerLogV2`), so one query joins the job log to the pod's logs and Defender alerts. Each runner node belongs to one org, so firewall and VNet flow records map to an org by node IP.
-- **Separation:** each org reads only its own job and runner logs in the tools, and nonprod and prod go to separate indexes. Log Analytics keeps container logs for a short time, readable by the platform team only. Job logs can hold secrets that masking missed, so access is as tight as the repo's.
-- **Retention:** GitHub keeps job logs 90 days by default, settable from 1 to 400 days for private and internal repos ([docs](https://docs.github.com/en/enterprise-cloud@latest/organizations/managing-organization-settings/configuring-the-retention-period-for-github-actions-artifacts-and-logs-in-your-organization)). Since Oct 1, 2026 the same setting also deletes checks, workflow runs and statuses ([changelog](https://github.blog/changelog/2026-10-01-actions-retention-now-covers-checks-runs-and-statuses)), so the tools and the archive, not GitHub, are the long-term record. Each tool's retention follows the enterprise's policy for that log class.
-- **Cost:** job logs are the largest volume and skip Log Analytics entirely. Send them in full to one search tool, and send the others job metadata and failed-job logs only. Container logs pay Log Analytics Basic ingestion plus the data export meter; they stay small because job output isn't in them.
-- **Integrity:** the archive is geo-redundant. If audit policy requires tamper-proof records, it also gets a time-based immutability (WORM) policy; confirm in the pilot that Event Hubs Capture writes to it. Changes to diagnostic settings, data export rules or Event Hubs raise an alert from the Activity log.
-- **Egress:** nothing in the clusters sends logs out of Azure. The Azure Monitor agents use Azure Monitor Private Link Scope, and the exporter reaches Event Hubs through a private endpoint. The tools pull from Event Hubs, which accepts only their published IP ranges or Private Link. Runner pods have no route to the tools.
+- **Correlation:** a job's `runner_name` is its runner pod's name, so one Dynatrace query joins the job log to the pod's logs and metrics, and the SOC can match it to Prisma Cloud alerts. Each runner node belongs to one org, so firewall and VNet flow records map to an org by node IP.
+- **Separation:** each org reads only its own job and runner logs in Dynatrace, and nonprod and prod are kept apart there. Job logs can hold secrets that masking missed, so access is as tight as the repo's.
+- **Retention:** GitHub keeps job logs 90 days by default, settable from 1 to 400 days for private and internal repos ([docs](https://docs.github.com/en/enterprise-cloud@latest/organizations/managing-organization-settings/configuring-the-retention-period-for-github-actions-artifacts-and-logs-in-your-organization)). Since Oct 1, 2026 the same setting also deletes checks, workflow runs and statuses ([changelog](https://github.blog/changelog/2026-10-01-actions-retention-now-covers-checks-runs-and-statuses)), so Dynatrace and the archive, not GitHub, are the long-term record. Retention per log class follows the enterprise's policy.
+- **Cost:** job logs are the largest volume. They go in full to Dynatrace; any other tool gets job metadata and failed-job logs only. The log module collects only runner and platform namespaces.
+- **Integrity:** the archive is geo-redundant. If audit policy requires tamper-proof records, it also gets a time-based immutability (WORM) policy; confirm in the pilot that Event Hubs Capture writes to it. Changes to diagnostic settings or Event Hubs raise an alert from the Activity log.
+- **Egress:** only the Dynatrace ActiveGate and the Prisma Cloud Defenders send data out of the clusters, through the firewall allowlist. The exporter reaches Event Hubs through a private endpoint, and the tools pull from Event Hubs, which accepts only their published IP ranges or Private Link. Runner pods have no route to the tools.
 
 **Confirm in the pilot:**
 
 - GitHub lists workflow run completions as API-only audit events on the Enterprise plan ([changelog](https://github.blog/changelog/2021-02-23-github-actions-workflow-run-events-are-now-included-in-the-audit-log/)). If they don't arrive through the stream, the exporter polls the enterprise audit log API for them instead.
-- `ContainerLogV2` exports to Event Hubs: it isn't on data export's unsupported list, but test it.
 - Dynatrace parses the job-log and GitHub audit hubs, and Arctic Wolf confirms which hubs it can read directly.
+- The Dynatrace Operator's log module and the Prisma Cloud Defender run on the tainted runner pools, and what each can see on Kata pools.
 
 ## Resilience and disaster recovery
 
@@ -447,7 +449,7 @@ Ready in the DR region before it's needed:
 
 - An ACR geo-replica with the golden images (Premium tier) ([docs](https://learn.microsoft.com/en-us/azure/container-registry/container-registry-geo-replication))
 - A Key Vault per org with the same App keys, kept in step by the key-rotation pipeline
-- Event Hubs, a Log Analytics workspace with its data export rule, and the job-log exporter, so logs and audit keep flowing
+- Event Hubs and the job-log exporter, so logs and audit keep flowing; the Dynatrace Operator and the Prisma Cloud Defender deploy with the cluster
 - Firewall rules, NSGs, private DNS and private endpoints from the same IaC, and vCPU quota for the NodePools' `limits.cpu`
 
 What must survive a regional outage, and how it's protected. The clusters themselves hold nothing to back up, so runners need no Velero or AKS Backup:
@@ -476,12 +478,12 @@ A drill twice a year proves it: scale the primary prod deploy scale sets to 0, r
 
 The platform is judged on four numbers: time for a job to start, failed runners, idle spend per org, and policy violations.
 
-- **Metrics:** enable ARC metrics on the controller and listeners. The Managed Prometheus add-on scrapes them through PodMonitor resources ([docs](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-scrape-crd)) into an Azure Monitor workspace, with dashboards in Azure Managed Grafana and Prometheus alert rules sending alerts through Azure Monitor action groups. Key series: `gha_job_startup_duration_seconds`, `gha_assigned_jobs` against `gha_desired_runners`, and `gha_controller_failed_ephemeral_runners` ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)).
-- **Dynatrace:** if the enterprise already runs the Dynatrace Operator on the shared clusters, it can scrape the same ARC endpoints, so Dynatrace shows the runner platform beside everything else. Exclude runner namespaces from OneAgent code-module injection, since job pods run untrusted, short-lived code.
+- **Metrics:** enable ARC metrics on the controller and listeners, and annotate their pods so the Dynatrace ActiveGate scrapes them ([docs](https://docs.dynatrace.com/docs/observe/infrastructure-observability/container-platform-monitoring/kubernetes-monitoring/monitor-prometheus-metrics)). Dashboards and alerts live in Dynatrace, beside Kubernetes and node metrics from the Dynatrace Operator. Key series: `gha_job_startup_duration_seconds`, `gha_assigned_jobs` against `gha_desired_runners`, and `gha_controller_failed_ephemeral_runners` ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)).
+- **Dynatrace Operator scope:** on runner nodes it runs the log module and Kubernetes monitoring only. Runner namespaces are excluded from OneAgent code-module injection, since job pods run untrusted, short-lived code.
 - **Logs:** controller, listener, runner and job logs follow [Logging and audit](#logging-and-audit), each with a retention policy, as GitHub advises. NAP events come from the `karpenter-events` control plane log category ([docs](https://learn.microsoft.com/en-us/azure/aks/use-node-auto-provisioning)).
 - **Synthetic canary:** a scheduled workflow in a platform repo runs a tiny job on the platform scale set every 30 minutes in each cluster, and on each org's scale sets once a day. It checks the whole path (GitHub, listener, node, image, egress) and catches what metrics miss, such as an expired App key or a firewall change. In prod the canary is an approved deploy workflow that deploys nothing. More frequent canaries on org scale sets would keep their nodes awake and cost money.
 - **Dashboards:** per org (jobs, start time, failures, spend), platform (controller, listeners, NodePools against their caps, vCPU quota, subnet IPs, log pipeline) and security (detections, admission denials).
-- **Alert routing:** platform alerts page the platform on-call through the enterprise paging tool; security detections go to the SOC, with Arctic Wolf triage first. Every alert links to a runbook.
+- **Alert routing:** Dynatrace pages the platform on-call through the enterprise paging tool; security detections from Prisma Cloud and the GitHub audit log go to the SOC, with Arctic Wolf triage first. Every alert links to a runbook.
 - **Dependencies:** GitHub's status page and Azure Resource Health for ACR, Key Vault, Event Hubs and the firewall, so an upstream incident isn't chased as a platform fault.
 - **Ownership:** the platform team owns the pipeline up to each tool's ingest; each tool's team owns parsing, dashboards and retention there; security owns the detection rules.
 
@@ -538,9 +540,10 @@ These decisions shape the build; the recommendation column is the default if no 
 | DR targets | RTO and RPO per environment | Prod deploy in minutes, nonprod CI in hours, RPO about zero |
 | Prod deploy DR | Rebuild; warm standby, active-active or held at `maxRunners: 0`; GitHub-hosted | Warm standby; active-active only if deploy targets are reachable from both regions |
 | CI during a regional outage | Wait for the rebuild; GitHub-hosted with private networking | Rebuild, plus GitHub-hosted for a short list of critical repos |
-| Where full job logs go | One search tool; every tool | One search tool (Splunk or Elastic); metadata and failed-job logs to the rest |
+| Where full job logs go | Dynatrace only; every tool | Dynatrace; metadata and failed-job logs to any other tool |
 | Hubs Arctic Wolf can't read directly | A small Event Hubs-to-syslog forwarder; a direct Arctic Wolf feed | The forwarder, unless Arctic Wolf confirms a direct feed |
-| Metrics and alerting home | Managed Prometheus and Grafana (AKS add-on); Dynatrace | Managed Prometheus for platform metrics and alerts; Dynatrace shows them too if the enterprise's operator scrapes ARC |
+| Pod log collection | Dynatrace Operator log module; Container insights exported through Event Hubs | Dynatrace Operator; Container insights only if the operator isn't allowed on runner nodes |
+| Runtime detection on Kata pods | VM boundary plus audit and flow logs; a Prisma Cloud option, if Palo Alto has one | Ask Palo Alto in the pilot |
 | Container network logs | Off; on | Off at first: VNet and firewall logs map flows to an org by node. Turn on if security wants per-pod flows and accepts the charge, which covers every node in the shared cluster |
 | Image signature check at admission | Wait for AKS Image Integrity to support deny; run Ratify ourselves | Wait, with digest-pinned images from the platform ACR meanwhile |
 | Service-level targets | The proposals in Monitoring and operations | Agree after a month of pilot data |
@@ -548,7 +551,7 @@ These decisions shape the build; the recommendation column is the default if no 
 
 Rollout:
 
-1. **Nonprod foundation:** on the nonprod cluster, the runner subnet and NSG, runner node pools, the admission policies (Pod Security labels, ValidatingAdmissionPolicy, Azure Policy assignments), the Defender, Container insights and Managed Prometheus add-ons, ACR, Key Vault, ARC controller, platform scale set and image pipeline, plus the log pipeline: audit log streaming, Event Hubs, the data export rule and the job-log exporter. Exit: guardrail tests pass, the pipeline builds the golden image on its own runners, and job logs and audit events reach every tool. The tests show:
+1. **Nonprod foundation:** on the nonprod cluster, the runner subnet and NSG, runner node pools, the admission policies (Pod Security labels, ValidatingAdmissionPolicy, Azure Policy assignments), the Dynatrace Operator and Prisma Cloud Defender, ACR, Key Vault, ARC controller, platform scale set and image pipeline, plus the log pipeline: audit log streaming, Event Hubs and the job-log exporter. Exit: guardrail tests pass, the pipeline builds the golden image on its own runners, and job logs and audit events reach every tool. The tests show:
    - a pod without the org's toleration is rejected
    - a job can't reach the metadata endpoint or a shared service
    - a runner pod can't read the GitHub App credential
@@ -591,20 +594,17 @@ Rollout:
 - [About Azure private networking for GitHub-hosted runners in your enterprise](https://docs.github.com/en/enterprise-cloud@latest/admin/configuring-settings/configuring-private-networking-for-hosted-compute-products/about-azure-private-networking-for-github-hosted-runners-in-your-enterprise) (GitHub Docs)
 - [GitHub receiver](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/receiver/githubreceiver) (OpenTelemetry Collector contrib)
 - [Azure logs](https://docs.dynatrace.com/docs/ingest-from/microsoft-azure-services/ingest-telemetry/azure-logs-and-events/azure-logs) (Dynatrace Docs)
-- [Configure Azure Event Hub inputs for the Splunk Add-on for Microsoft Cloud Services](https://docs.splunk.com/Documentation/AddOns/latest/MSCloudServices/Configureeventhubs) (Splunk Docs)
-- [Azure Event Hub Input](https://www.elastic.co/docs/reference/integrations/azure/eventhub) (Elastic Docs)
 - [Microsoft Azure monitoring](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/cloud-detection-and-response-integrations/configure-microsoft-azure) (Arctic Wolf Docs)
 - [Configure a syslog server to send logs to Arctic Wolf](https://docs.arcticwolf.com/en/active-response-log-forwarding-and-security-monitoring/syslog-forwarding/syslog-integrations/configure-generic-syslog-configuration) (Arctic Wolf Docs)
 - [Displaying IP addresses in the audit log for your enterprise](https://docs.github.com/en/enterprise-cloud@latest/admin/monitoring-activity-in-your-enterprise/reviewing-audit-logs-for-your-enterprise/displaying-ip-addresses-in-the-audit-log-for-your-enterprise) (GitHub Docs)
 - [Managing allowed IP addresses for a GitHub App](https://docs.github.com/en/enterprise-cloud@latest/apps/maintaining-github-apps/managing-allowed-ip-addresses-for-a-github-app) (GitHub Docs)
-- [Overview of Container security in Microsoft Defender for Containers](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-for-containers-introduction) (Microsoft Learn)
 - [Azure Key Vault soft-delete overview](https://learn.microsoft.com/en-us/azure/key-vault/general/soft-delete-overview) (Microsoft Learn)
 - [Azure Policy for Kubernetes clusters](https://learn.microsoft.com/en-us/azure/governance/policy/concepts/policy-for-kubernetes) (Microsoft Learn)
 - [Validating Admission Policy](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/) (Kubernetes docs)
 - [Gatekeeper chart default values](https://images.chainguard.dev/directory/community-chart/gatekeeper/defaultValues) (Chainguard)
 - [Image Integrity in AKS (preview)](https://learn.microsoft.com/en-us/azure/aks/image-integrity) (Microsoft Learn)
 - [Container network logs](https://learn.microsoft.com/en-us/azure/aks/container-network-observability-logs) (Microsoft Learn)
-- [Enable Defender for Containers](https://learn.microsoft.com/en-us/azure/defender-for-cloud/defender-for-containers-enable-plan) (Microsoft Learn)
-- [Container insights log schema (ContainerLogV2)](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/container-insights-logging-v2) (Microsoft Learn)
-- [Log Analytics workspace data export](https://learn.microsoft.com/en-us/azure/azure-monitor/logs/logs-data-export) (Microsoft Learn)
-- [Custom Prometheus scrape jobs with CRDs](https://learn.microsoft.com/en-us/azure/azure-monitor/containers/prometheus-metrics-scrape-crd) (Microsoft Learn)
+- [Kubernetes log monitoring](https://docs.dynatrace.com/docs/ingest-from/setup-on-k8s/deployment/k8s-log-monitoring) (Dynatrace Docs)
+- [Monitor Prometheus metrics](https://docs.dynatrace.com/docs/observe/infrastructure-observability/container-platform-monitoring/kubernetes-monitoring/monitor-prometheus-metrics) (Dynatrace Docs)
+- [Prisma Cloud runtime security: get started](https://docs.prismacloud.io/content-collections/runtime-security/install/get-started) (Prisma Cloud Docs)
+- [Prisma Cloud runtime alert mechanism](https://docs.prismacloud.io/content-collections/runtime-security/alerts/alert-mechanism) (Prisma Cloud Docs)
