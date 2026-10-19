@@ -39,7 +39,7 @@ Teams in several GitHub Enterprise Cloud orgs need self-hosted GitHub Actions ru
 
 Each goal and how the design meets it:
 
-| Requirement | How the design meets it |
+| Goal | How the design meets it |
 | --- | --- |
 | Isolation between GitHub orgs | Per org: GitHub App, runner scale sets, namespace, secrets, network policy and node pool. Jobs from two orgs never share a node. Docker jobs also run in their own Kata pod VM. |
 | Safe on shared enterprise clusters | Runner node pools in their own subnet with no route to the shared services. Admission policy, Pod Security and default-deny network policy on every runner namespace. Security signs off the residual risk before the pilot. |
