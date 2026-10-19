@@ -5,7 +5,7 @@ _As of Oct 19, 2026_
 | | |
 | --- | --- |
 | Status | Draft for review |
-| Version | 0.5 |
+| Version | 0.6 |
 | Owner | Platform engineering (runner platform) |
 | Reviewers | Security, network, shared AKS platform team, observability (Dynatrace) team, a lead from each pilot org |
 | Approvers | To be named: security and the shared AKS platform owner |
@@ -261,8 +261,9 @@ What to set at each level, where it's set, and what enforces it. "Admission poli
 | Azure | Runner subnet NSG blocks the shared services; all egress through the Azure Firewall FQDN allowlist | Terraform, firewall policy | NSG, Azure Firewall |
 | Azure | Private endpoints for ACR, Key Vault and Event Hubs; diagnostic settings on every resource | Terraform | Azure Policy |
 | Azure | A Key Vault per org, with soft delete, purge protection and Azure RBAC | Terraform | Azure Policy |
-| Cluster | KMS encryption for secrets; SSH off; encryption at host; ephemeral OS disks; node OS and cluster auto-upgrade | Terraform | Azure Policy, AKS |
-| Node pool | A pool per org, tainted `gh-org=<org>`, with a CPU cap and daily node expiry; Kata pools for Docker jobs | Terraform (NAP NodePools) | NAP; admission policy keeps other pods off |
+| Cluster | Private API server; Entra ID and Azure RBAC; no standing admin; RBAC without wildcards or escalation; KMS encryption for secrets; auto-upgrade | Terraform, PIM | Azure Policy, AKS, Kubernetes RBAC |
+| Node pool | A pool per org, tainted `gh-org=<org>`, with a CPU cap and daily node expiry; Kata pools for Docker jobs; only approved agents tolerate runner taints | Terraform (NAP NodePools) | NAP; admission policy keeps other pods off |
+| Node pool | Azure Linux 3, Trusted Launch on runc pools, ephemeral OS disks with encryption at host, SSH off, no public IPs | Terraform | Azure Policy, AKS |
 | Namespace | One per org, plus `-docker`, labelled `gh-org=<org>`; no Azure Policy ignore label | Terraform template | VAP |
 | Namespace | Pod Security `restricted`; `privileged` only in `-docker` namespaces | Namespace label | PSA |
 | Namespace | Default-deny network policy; ResourceQuota and LimitRange | Terraform template | Azure CNI Powered by Cilium; Kubernetes |
@@ -278,7 +279,10 @@ What to set at each level, where it's set, and what enforces it. "Admission poli
 | Image | Hardened (no sudo), scanned, signed, rebuilt weekly | Image pipeline | Pipeline gates; Prisma Cloud scanning |
 | Image | Packages only through the internal proxy | Firewall policy | Azure Firewall |
 | Network | Metadata endpoint and WireServer blocked; API server reachable from runner pods only | Network policy | Azure CNI Powered by Cilium |
+| Network | No inbound Services or Ingress; egress and DNS only through Azure Firewall | Terraform, firewall policy | VAP; Azure Firewall |
 | Credentials | GitHub App keys out of runners' reach; jobs reach Azure only through GitHub OIDC; runner pods get no Azure identity | Helm, Entra federated credentials | Kubernetes RBAC, Entra ID |
+| Identity | Just-in-time admin through PIM, a sealed break-glass account, workload identity only for platform components, quarterly access reviews | Entra ID, Terraform | PIM, Entra ID |
+| Audit | GitHub, Kubernetes, Azure, Entra ID, Key Vault and network audit logs to the SOC and the archive | Diagnostic settings, audit log streaming | Azure Policy keeps them on; Activity log alerts on changes |
 | Detection | Runtime rules for shells, miners, metadata calls and odd egress; SIEM detections; quarantine runbook | Prisma Cloud, Arctic Wolf | Prisma Cloud, the SOC |
 
 ### Admission policy
@@ -298,6 +302,8 @@ What to plan for:
 - **Azure Policy changes take up to 15 minutes.** The add-on checks for assignment changes and rescans the cluster every 15 minutes. Onboarding an org needs no new assignment, because the placement policy reads the namespace label.
 - **Custom Rego can't read namespace labels.** Custom Azure Policy definitions can't use Gatekeeper's data sync, which is why the placement rules are ValidatingAdmissionPolicy. Azure Policy also accepts custom CEL policies, so the rules can move into Azure Policy later if the enterprise wants every rule there.
 - **The ignore label.** The add-on doesn't deny in a namespace that carries its ignore label. Only Terraform can label runner namespaces, and the ValidatingAdmissionPolicy rejects that label on them.
+- **Azure resources too.** Azure Policy also enforces the Azure side: private endpoints, no public IPs on runner nodes, diagnostic settings, customer-managed keys and allowed VM sizes.
+- **Policy lifecycle.** Policies live in Git and change by PR, with tests in CI ([Vulnerability management and testing](#vulnerability-management-and-testing)). A new rule starts in audit or warn mode (Azure Policy's audit effect, or `validationActions: [Warn, Audit]` on a ValidatingAdmissionPolicy) and moves to deny after a week with no unexpected hits. The platform team writes policies and security approves them. Exceptions go through a PR with an expiry date.
 
 ### Namespaces
 
@@ -329,6 +335,25 @@ What to plan for:
 - Only the `dind` sidecar may be privileged, and only inside Kata.
 - Many public job images (node, python) run as root, which `restricted` rejects. Publish non-root job images in ACR, or allow root only in Kata namespaces.
 
+### Node pools
+
+- **One pool per org per environment:** a NAP NodePool, or a classic pool with autoscaler minimum 0 for Kata. Each is tainted `gh-org=<org>:NoSchedule` and labelled `gh-org=<org>`. The system pool is tainted `CriticalAddonsOnly` and the shared-services pools carry their own taint, so runner pods can't land on either.
+- **Only approved agents tolerate runner taints:** the Dynatrace log module, the Prisma Cloud Defender and AKS's own DaemonSets. Admission policy rejects any other pod outside runner namespaces that tolerates a `gh-org` taint.
+- **Size limits:** `limits.cpu` per NodePool caps each org, NodePool requirements list the allowed VM families, and spot capacity is used only in `<org>-spot` pools.
+- **OS:** Azure Linux 3, patched weekly through the node OS upgrade channel; Trusted Launch (secure boot and vTPM) on runc pools. Kata pools need Gen2 VM sizes with nested virtualization and don't support Trusted Launch.
+- **Disks:** ephemeral OS disks with encryption at host, and no data disks ([Node storage](#node-storage)).
+- **Access:** SSH disabled ([docs](https://learn.microsoft.com/en-us/azure/aks/manage-ssh-node-access)), no public IPs on nodes, and the runner subnet's NSG. The kubelet identity can only pull from the platform ACR.
+- **Lifecycle:** runner nodes expire daily, so anything planted on a node doesn't survive long ([docs](https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning-disruption)). Empty nodes are consolidated quickly, running jobs carry `karpenter.sh/do-not-disrupt`, and Image Cleaner removes stale images.
+
+### Kubernetes cluster
+
+- **API server:** private, with Entra ID sign-in and Azure RBAC; local accounts disabled. The Kubernetes version stays in support through the cluster auto-upgrade channel.
+- **Admin access:** no standing cluster-admin. Admins get just-in-time access through PIM, and a sealed break-glass account alerts the SOC when used ([Identity and access](#identity-and-access)).
+- **Protected components:** only the platform team can change admission webhooks, ValidatingAdmissionPolicies, CRDs and `arc-system`, where ARC's controller, listeners and App credentials live.
+- **RBAC hygiene:** no wildcard roles. Only cluster admins have `escalate`, `bind` and `impersonate`. Runner service accounts act only in their own namespace, `pods/exec` in runner namespaces is limited to the runner service account and just-in-time admins, and default service accounts don't mount tokens.
+- **Secrets:** encrypted in etcd with a customer-managed key (KMS). Workload identity is used only by platform components (the job-log exporter and External Secrets), never by runner pods.
+- **Audit:** Kubernetes audit logs go to the SIEM ([Audit](#audit)).
+
 ### Network
 
 - Default-deny ingress and egress in every runner namespace. Runner and job pods need no inbound traffic.
@@ -340,6 +365,26 @@ What to plan for:
 - The firewall allows only GitHub Actions endpoints, the platform ACR and the internal package proxy, by FQDN. Per-org additions go through a PR.
 - GitHub's required endpoints include `results-receiver.actions.githubusercontent.com` and `*.blob.core.windows.net`, which carries job logs, artifacts and caches ([docs](https://docs.github.com/en/enterprise-cloud@latest/actions/concepts/runners/communicating-with-self-hosted-runners)). That wildcard lets a job upload data to any Azure storage account. In the pilot, try narrowing it to the storage accounts the firewall logs show; GitHub can change them, so if that proves fragile, keep the wildcard and alert on unusual upload volume per runner.
 - The runner subnet's NSG blocks the shared services ([Sharing the cluster](#sharing-the-cluster-with-enterprise-services)).
+- No inbound paths: admission policy rejects Services of type LoadBalancer or NodePort and Ingress objects in runner namespaces.
+- Outbound goes through a user-defined route to Azure Firewall, and nodes have no public IPs.
+- DNS: pods resolve only through CoreDNS, which forwards to the firewall's DNS proxy, so the FQDN rules and DNS logs see every lookup and DNS tunnelling is easier to spot ([docs](https://learn.microsoft.com/en-us/azure/firewall/dns-settings)).
+- ACR, Key Vault and Event Hubs are reached only through private endpoints and private DNS zones.
+- If the hub firewall is Azure Firewall Premium, turn on intrusion detection and prevention (IDPS) for runner egress.
+
+### Identity and access
+
+| Who | Access | How |
+| --- | --- | --- |
+| Platform engineers | Read on the clusters; admin only when needed | Entra ID groups, Azure RBAC, PIM with approval and a time limit |
+| Org owners and developers | No cluster access; they manage workflows and which repos use their runner groups | GitHub org roles |
+| Security and the SOC | Read access to audit logs, Prisma Cloud and Dynatrace | Each tool's roles |
+| Break-glass | Emergency cluster admin | A sealed account, with an alert on every use |
+| ARC controller | Each org's GitHub App credential | Kubernetes secret in `arc-system` or ARC's Key Vault mode |
+| External Secrets | Read on each org's Key Vault | Workload identity, one per org |
+| Job-log exporter | Read-only GitHub App per org; send to Event Hubs | Workload identity |
+| Runner and job pods | Nothing in Azure; Azure access only through GitHub OIDC per job | No workload identity |
+
+Access is reviewed every quarter: PIM eligibility, GitHub App installations and permissions, runner group repo lists, and Key Vault access.
 
 ### GitHub App credentials
 
@@ -357,6 +402,19 @@ Also:
 - Each org has separate nonprod and prod Apps, with keys only in that environment's vault ([Production and non-production](#production-and-non-production)).
 - Keys are rotated on a fixed schedule.
 
+### GitHub settings
+
+- Runner groups are limited to selected repos; public repos can't use them; fork pull requests need approval before running.
+- Build and deploy runners are separate scale sets.
+  - Build runners have no route to internal networks.
+  - Deploy runner groups are limited to approved reusable workflows ([GitHub blog](https://github.blog/2022-03-23-github-actions-secure-self-hosted-runners-specific-workflows/)), and deploy jobs use environments with required reviewers.
+- Jobs reach Azure only through GitHub OIDC, with federated credentials bound to org, repo and environment. Runner pods get no Azure identity.
+- For prod deploys, the OIDC subject claim also includes `job_workflow_ref`, so only the approved reusable deploy workflow can get the prod Azure token ([docs](https://docs.github.com/en/actions/reference/security/oidc)).
+- Deploy secrets live only in GitHub environments with required reviewers, never as org-wide secrets.
+- The default `GITHUB_TOKEN` permissions are read-only.
+- Workflow files are protected by CODEOWNERS on `.github/workflows` and rulesets that require review, so a deploy workflow can't change unreviewed. Deploys run only from protected branches.
+- `pull_request_target` workflows never check out and run pull-request code on self-hosted runners.
+
 ### Images and supply chain
 
 - Runner and job pods run only images from the platform ACR, referenced by digest. The pipeline signs each image and verifies the signature before promotion; signature checks at admission wait for AKS Image Integrity to support deny.
@@ -365,18 +423,7 @@ Also:
 - Enterprise Actions policy allows only approved actions and requires pinning them to a commit SHA ([changelog](https://github.blog/changelog/2025-08-15-github-actions-policy-now-supports-blocking-and-sha-pinning-actions/)).
 - No caches or volumes are shared across orgs.
 - ACR: private endpoint, anonymous pull off, immutable tags.
-
-### Control plane and nodes
-
-- Private API server; Entra ID sign-in with Azure RBAC; local accounts disabled.
-- No standing cluster-admin: admins get just-in-time access through PIM. Only the platform team can change webhooks, policies, CRDs and `arc-system`.
-- Secrets in etcd are encrypted with a customer-managed key (KMS), and Kubernetes audit logs go to the SIEM.
-- Nodes:
-  - SSH disabled ([docs](https://learn.microsoft.com/en-us/azure/aks/manage-ssh-node-access))
-  - ephemeral OS disks with encryption at host
-  - runner nodes expire daily through the NodePool expiry setting, so anything planted on a node doesn't survive long ([docs](https://learn.microsoft.com/en-us/azure/aks/node-auto-provisioning-disruption))
-  - Trusted Launch on runc runner pools (Kata pools don't support it)
-  - kubelet identity limited to pulling from the platform ACR, and Image Cleaner removes stale images
+- Images that jobs build get build provenance attestations, which the deploy pipeline verifies before it deploys them.
 
 ### Data protection
 
@@ -385,6 +432,25 @@ Also:
 - **Job data:** workspaces live in `emptyDir` and go with the pod, and nodes expire daily. Artifacts, caches and job logs live in GitHub under its retention settings.
 - **Key Vault:** soft delete and purge protection on, Azure RBAC, private endpoint only ([docs](https://learn.microsoft.com/en-us/azure/key-vault/general/soft-delete-overview)).
 
+### Audit
+
+Every change and every privileged action leaves a record that the SOC can query and that can't be quietly removed.
+
+| Activity | Audit source | Where it goes |
+| --- | --- | --- |
+| Runner registration, runner groups, Actions policy, App installations and permissions, workflow runs, settings | GitHub enterprise audit log, with IP addresses turned on | Event Hubs to Arctic Wolf, Dynatrace and the archive |
+| Kubernetes API writes: create, update, delete, `exec`, RBAC and policy changes | AKS `kube-audit-admin` | Same |
+| Azure resource and policy changes | Azure Activity log | Same |
+| Sign-ins and privileged access | Entra ID sign-in logs, PIM audit | Same |
+| Secret access | Key Vault logs | Same |
+| Network | Azure Firewall logs, including DNS proxy, and VNet flow logs | Same |
+| Policy results | Azure Policy compliance; ValidatingAdmissionPolicy denials and audit annotations | Azure Policy, Dynatrace |
+| Runtime | Prisma Cloud events | The Prisma Cloud console, then the SOC |
+
+- `kube-audit-admin` leaves out `get` and `list` requests, so reading a Kubernetes secret isn't recorded ([docs](https://learn.microsoft.com/en-us/azure/aks/monitor-apiserver)). The full `kube-audit` category records reads but costs much more. Decide with security whether secret reads in runner and `arc-system` namespaces need it.
+- Retention follows the enterprise's policy for each source. The archive is geo-redundant and, where audit policy requires, immutable. Changes to diagnostic settings or audit streaming raise an alert.
+- Only the SOC and the platform team can read audit logs, and that access is itself logged.
+
 ### Vulnerability management and testing
 
 - **Images:** scanned at build, then continuously in ACR and on the nodes by Prisma Cloud. A new critical CVE triggers a rebuild; the weekly rebuild keeps the rest within the enterprise's CVE SLA.
@@ -392,17 +458,6 @@ Also:
 - **Posture:** Prisma Cloud compliance checks, including the CIS Kubernetes benchmark, are tracked per cluster. Azure Policy enforces the Azure side: diagnostic settings, private endpoints, no public IPs on runner nodes, customer-managed keys.
 - **Policy tests:** every policy change is tested in CI against a test cluster, with sample pods that must be admitted and others that must be rejected. The guardrail tests from the rollout run again after every cluster or ARC upgrade.
 - **Penetration test:** an independent test before prod deploy runners go live, then yearly. It covers container escape, cross-org access, metadata access, exfiltration and rogue runner registration.
-
-### GitHub settings
-
-- Runner groups are limited to selected repos; public repos can't use them; fork pull requests need approval before running.
-- Build and deploy runners are separate scale sets.
-  - Build runners have no route to internal networks.
-  - Deploy runner groups are limited to approved reusable workflows ([GitHub blog](https://github.blog/2022-03-23-github-actions-secure-self-hosted-runners-specific-workflows/)), and deploy jobs use environments with required reviewers.
-- Jobs reach Azure only through GitHub OIDC, with federated credentials bound to org, repo and environment. Runner pods get no Azure identity.
-- The default `GITHUB_TOKEN` permissions are read-only.
-- Workflow files are protected by CODEOWNERS on `.github/workflows` and rulesets that require review, so a deploy workflow can't change unreviewed. Deploys run only from protected branches.
-- `pull_request_target` workflows never check out and run pull-request code on self-hosted runners.
 
 ### Detection and response
 
@@ -425,6 +480,12 @@ SIEM detections to build before the pilot, triaged by Arctic Wolf and owned by s
 | A GitHub App key read by any identity other than ARC's | Key Vault logs |
 | A change in `arc-system`, admission webhooks or policies outside a change window | Kubernetes audit log |
 | Cluster-admin activation through PIM | Entra ID logs |
+
+### Compliance
+
+- Each control in this section maps to the enterprise's control framework. Prisma Cloud and Azure Policy report CIS Kubernetes and AKS benchmark results per cluster.
+- The audit trail, the validation test results ([Rollout and validation](#rollout-and-validation)) and the quarterly access reviews are the evidence.
+- The threat model and the risks are reviewed every year, and after any major change to the clusters, ARC or the GitHub setup.
 
 ## Logging and audit
 
@@ -719,6 +780,9 @@ These decisions shape the build; the recommendation column is the default if no 
 - [Monitor Prometheus metrics](https://docs.dynatrace.com/docs/observe/infrastructure-observability/container-platform-monitoring/kubernetes-monitoring/monitor-prometheus-metrics) (Dynatrace Docs)
 - [Prisma Cloud runtime security: get started](https://docs.prismacloud.io/content-collections/runtime-security/install/get-started) (Prisma Cloud Docs)
 - [Prisma Cloud runtime alert mechanism](https://docs.prismacloud.io/content-collections/runtime-security/alerts/alert-mechanism) (Prisma Cloud Docs)
+- [Monitor the AKS API server and audit logs](https://learn.microsoft.com/en-us/azure/aks/monitor-apiserver) (Microsoft Learn)
+- [OpenID Connect reference](https://docs.github.com/en/actions/reference/security/oidc) (GitHub Docs)
+- [Azure Firewall DNS settings](https://learn.microsoft.com/en-us/azure/firewall/dns-settings) (Microsoft Learn)
 
 ## Glossary
 
@@ -744,3 +808,4 @@ These decisions shape the build; the recommendation column is the default if no 
 | 0.3 | Oct 14, 2026 | Prod and nonprod, logging and audit, monitoring, DR, landing-zone diagrams |
 | 0.4 | Oct 18, 2026 | AKS add-ons where they exist; Dynatrace for observability, Prisma Cloud for runtime security |
 | 0.5 | Oct 19, 2026 | Guardrails-by-level table; design-document structure: context, goals, alternatives, risks, validation, glossary |
+| 0.6 | Oct 19, 2026 | Security design: node pools, Kubernetes cluster, identity and access, audit and compliance; network, policy-lifecycle and OIDC additions |
