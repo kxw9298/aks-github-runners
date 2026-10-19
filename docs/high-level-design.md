@@ -237,6 +237,41 @@ Runners run untrusted code from every onboarded repo, so security is layered: ea
 | Admin misuse or a bad change | Just-in-time admin through PIM; changes by PR; policy tests in CI | Kubernetes audit log, Entra ID logs |
 | Tampering with deploy workflows | Approved reusable workflows; CODEOWNERS and rulesets on workflow files; protected branches | GitHub audit log |
 
+### Guardrails by level
+
+What to set at each level, where it's set, and what enforces it. "Admission policy" means the three layers in [Admission policy](#admission-policy): Pod Security Admission (PSA), ValidatingAdmissionPolicy (VAP) and the Azure Policy add-on.
+
+| Level | Guardrail | Set in | Enforced by |
+| --- | --- | --- | --- |
+| GitHub | Runner groups limited to selected repos; public repos blocked; fork pull requests need approval | Org settings | GitHub |
+| GitHub | Deploy runner groups limited to approved reusable workflows; environments with required reviewers | Org and repo settings | GitHub; SIEM alert on any runner in a deploy group outside the prod or DR scale sets |
+| GitHub | Only approved actions, pinned to a commit SHA; `GITHUB_TOKEN` read-only by default | Enterprise Actions policy | GitHub |
+| GitHub | CODEOWNERS and rulesets on `.github/workflows`; deploys only from protected branches | Rulesets | GitHub |
+| GitHub | One App per org per environment, with only "Self-hosted runners: read and write" | App registration | GitHub; audit-log alerts |
+| Azure | Private API server, Entra ID with Azure RBAC, local accounts off, admin only through PIM | Terraform | Azure Policy |
+| Azure | Runner subnet NSG blocks the shared services; all egress through the Azure Firewall FQDN allowlist | Terraform, firewall policy | NSG, Azure Firewall |
+| Azure | Private endpoints for ACR, Key Vault and Event Hubs; diagnostic settings on every resource | Terraform | Azure Policy |
+| Azure | A Key Vault per org, with soft delete, purge protection and Azure RBAC | Terraform | Azure Policy |
+| Cluster | KMS encryption for secrets; SSH off; encryption at host; ephemeral OS disks; node OS and cluster auto-upgrade | Terraform | Azure Policy, AKS |
+| Node pool | A pool per org, tainted `gh-org=<org>`, with a CPU cap and daily node expiry; Kata pools for Docker jobs | Terraform (NAP NodePools) | NAP; admission policy keeps other pods off |
+| Namespace | One per org, plus `-docker`, labelled `gh-org=<org>`; no Azure Policy ignore label | Terraform template | VAP |
+| Namespace | Pod Security `restricted`; `privileged` only in `-docker` namespaces | Namespace label | PSA |
+| Namespace | Default-deny network policy; ResourceQuota and LimitRange | Terraform template | Azure CNI Powered by Cilium; Kubernetes |
+| Namespace | Runner service account with only what the hooks need, no secret read; no human write access | Terraform, Helm | Kubernetes RBAC |
+| Pod | The org's node selector and toleration, never another org's; no `spec.nodeName` | Helm values, hook template | VAP |
+| Pod | No `hostNetwork`, `hostPID`, `hostIPC`, `hostPath` or `hostPort` | Helm values, hook template | PSA |
+| Pod | No service account token on job pods; CPU, memory and ephemeral-storage limits; `activeDeadlineSeconds` | Helm values, hook template | VAP |
+| Pod | `runtimeClassName: kata-vm-isolation` in `-docker` namespaces | Helm values | VAP |
+| Container | Non-root, no privilege escalation, all capabilities dropped, seccomp `RuntimeDefault` | Helm values, hook template | PSA |
+| Container | Read-only root filesystem on the runner, with `emptyDir` for `_work` and `/tmp` | Helm values | Helm values |
+| Container | Privileged only for the `dind` sidecar, inside Kata | Helm values | PSA and VAP |
+| Image | Only from the platform ACR, pinned by digest | Helm values, workflows | VAP; Azure Policy allowed-images policy |
+| Image | Hardened (no sudo), scanned, signed, rebuilt weekly | Image pipeline | Pipeline gates; Prisma Cloud scanning |
+| Image | Packages only through the internal proxy | Firewall policy | Azure Firewall |
+| Network | Metadata endpoint and WireServer blocked; API server reachable from runner pods only | Network policy | Azure CNI Powered by Cilium |
+| Credentials | GitHub App keys out of runners' reach; jobs reach Azure only through GitHub OIDC; runner pods get no Azure identity | Helm, Entra federated credentials | Kubernetes RBAC, Entra ID |
+| Detection | Runtime rules for shells, miners, metadata calls and odd egress; SIEM detections; quarantine runbook | Prisma Cloud, Arctic Wolf | Prisma Cloud, the SOC |
+
 ### Admission policy
 
 Three layers check every pod in a runner namespace. The first two are built into the Kubernetes API server, so they need no add-on and fail closed.
