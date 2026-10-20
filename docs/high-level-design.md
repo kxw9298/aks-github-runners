@@ -5,7 +5,7 @@ _As of Oct 19, 2026_
 | | |
 | --- | --- |
 | Status | Draft for review |
-| Version | 0.6 |
+| Version | 0.7 |
 | Owner | Platform engineering (runner platform) |
 | Reviewers | Security, network, shared AKS platform team, observability (Dynatrace) team, a lead from each pilot org |
 | Approvers | To be named: security and the shared AKS platform owner |
@@ -280,7 +280,7 @@ What to set at each level, where it's set, and what enforces it. "Admission poli
 | Image | Packages only through the internal proxy | Firewall policy | Azure Firewall |
 | Network | Metadata endpoint and WireServer blocked; API server reachable from runner pods only | Network policy | Azure CNI Powered by Cilium |
 | Network | No inbound Services or Ingress; egress and DNS only through Azure Firewall | Terraform, firewall policy | VAP; Azure Firewall |
-| Credentials | GitHub App keys out of runners' reach; jobs reach Azure only through GitHub OIDC; runner pods get no Azure identity | Helm, Entra federated credentials | Kubernetes RBAC, Entra ID |
+| Credentials | GitHub App keys out of runners' reach; jobs reach Azure only through GitHub OIDC, with role assignments scoped to what each repo or environment deploys; runner pods get no Azure identity | Helm, Entra federated credentials, Azure RBAC | Kubernetes RBAC, Entra ID |
 | Identity | Just-in-time admin through PIM, a sealed break-glass account, workload identity only for platform components, quarterly access reviews | Entra ID, Terraform | PIM, Entra ID |
 | Audit | GitHub, Kubernetes, Azure, Entra ID, Key Vault and network audit logs to the SOC and the archive | Diagnostic settings, audit log streaming | Azure Policy keeps them on; Activity log alerts on changes |
 | Detection | Runtime rules for shells, miners, metadata calls and odd egress; SIEM detections; quarantine runbook | Prisma Cloud, Arctic Wolf | Prisma Cloud, the SOC |
@@ -334,6 +334,21 @@ What to plan for:
 - Job containers come from workflows, not the Helm chart, so they get the same settings through the hook extension template, and admission policy enforces them.
 - Only the `dind` sidecar may be privileged, and only inside Kata.
 - Many public job images (node, python) run as root, which `restricted` rejects. Publish non-root job images in ACR, or allow root only in Kata namespaces.
+
+### Least privilege per job
+
+Every runner and job pod gets only what its job needs, for only as long as the job runs.
+
+| Privilege | What a job gets | How it's limited |
+| --- | --- | --- |
+| Linux | Non-root user, no added capabilities, no privilege escalation, seccomp `RuntimeDefault`; privileged only for the `dind` sidecar, inside Kata | Pod Security `restricted`; ValidatingAdmissionPolicy |
+| Host | No host network, PID, IPC, paths or ports; no container runtime socket | Pod Security `restricted` |
+| Kubernetes API | Job pods: no service account token. Runner pod: only the pod, exec and log verbs the hooks need, in its own namespace, with no secret read | Hook template; a custom runner role |
+| Azure | No identity on the pod. A short-lived OIDC token per job, whose Azure role assignment covers only the resource groups that repo or environment deploys to, never the subscription | Entra federated credentials, Azure RBAC |
+| GitHub | `GITHUB_TOKEN` read-only by default; a job asks for more with `permissions:` | Org default token settings |
+| Secrets | Only the secrets the workflow references; deploy secrets only in protected environments | GitHub secret scoping |
+| Network | Only the firewall-allowlisted endpoints; no other namespace, the metadata endpoint or the shared services | Default-deny network policy, Azure Firewall, NSG |
+| Resources and time | Fixed CPU, memory and disk; a maximum run time; the pod and its data are deleted when the job ends | LimitRange, ResourceQuota, `activeDeadlineSeconds`, ephemeral runners |
 
 ### Node pools
 
@@ -809,3 +824,4 @@ These decisions shape the build; the recommendation column is the default if no 
 | 0.4 | Oct 18, 2026 | AKS add-ons where they exist; Dynatrace for observability, Prisma Cloud for runtime security |
 | 0.5 | Oct 19, 2026 | Guardrails-by-level table; design-document structure: context, goals, alternatives, risks, validation, glossary |
 | 0.6 | Oct 19, 2026 | Security design: node pools, Kubernetes cluster, identity and access, audit and compliance; network, policy-lifecycle and OIDC additions |
+| 0.7 | Oct 19, 2026 | Least privilege per job; OIDC role assignments scoped per repo or environment |
