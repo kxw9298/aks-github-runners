@@ -15,6 +15,7 @@ Design goals:
 | [`docs/high-level-design.md`](docs/high-level-design.md) | High-level design: architecture, prod and nonprod, isolation model, cost, node storage, image and OS lifecycle, security design and threat model, logging and audit, disaster recovery, monitoring and operations, open decisions and rollout |
 | [`docs/images/architecture.png`](docs/images/architecture.png) ([`.drawio`](docs/images/architecture.drawio)) | Platform architecture diagram |
 | [`docs/images/logging.png`](docs/images/logging.png) ([`.drawio`](docs/images/logging.drawio)) | Logging and audit pipeline diagram |
+| [`docs/runbook-github-app-nonprod.md`](docs/runbook-github-app-nonprod.md) | Runbook: GitHub App for one org in nonprod — register, install, store in Key Vault, configure ARC, verify, rotate, respond to a leak, decommission |
 | [`docs/poc-setup.md`](docs/poc-setup.md) | Step-by-step repository-scoped AKS/ARC PoC setup and teardown |
 | [`docs/poc-deployment.md`](docs/poc-deployment.md) | Deployment observations and live-test results |
 | [`docs/keyvault-credentials.md`](docs/keyvault-credentials.md) | Key Vault, workload identity, credential synchronization and recovery |
