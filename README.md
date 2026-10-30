@@ -12,7 +12,7 @@ Design goals:
 
 | Path | What it is |
 | --- | --- |
-| [`docs/high-level-design.md`](docs/high-level-design.md) | High-level design: architecture, prod and nonprod, isolation model, cost, node storage, image and OS lifecycle, security design and threat model, logging and audit, disaster recovery, monitoring and operations, open decisions and rollout |
+| [`docs/high-level-design.md`](docs/high-level-design.md) | High-level design: architecture, prod and nonprod, isolation model, cost, node storage, image and OS lifecycle, deployment with GitOps (Argo CD), security design and threat model, logging and audit, disaster recovery, monitoring and operations, open decisions and rollout |
 | [`docs/images/architecture.png`](docs/images/architecture.png) ([`.drawio`](docs/images/architecture.drawio)) | Platform architecture diagram |
 | [`docs/images/logging.png`](docs/images/logging.png) ([`.drawio`](docs/images/logging.drawio)) | Logging and audit pipeline diagram |
 | [`docs/poc-setup.md`](docs/poc-setup.md) | Step-by-step repository-scoped AKS/ARC PoC setup and teardown |
@@ -33,3 +33,7 @@ pipeline remain follow-up work. See the setup guide and deployment record above.
 All Azure and Kubernetes infrastructure is declared in Terraform. ARC is installed
 through Terraform-managed Helm releases. Existing PoC resources are adopted by
 Terraform imports; lifecycle changes use `terraform plan`, `apply`, and `destroy`.
+
+The production design is different: Terraform builds the Azure side and bootstraps
+Argo CD, and Argo CD deploys everything inside the clusters from Git. No one runs
+`kubectl apply`. See the design's GitOps section.

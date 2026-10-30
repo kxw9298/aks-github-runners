@@ -1,11 +1,11 @@
 # GitHub Runners on AKS — High-Level Design
 
-_As of Oct 19, 2026_
+_As of Oct 29, 2026_
 
 | | |
 | --- | --- |
 | Status | Draft for review |
-| Version | 0.7 |
+| Version | 0.8 |
 | Owner | Platform engineering (runner platform) |
 | Reviewers | Security, network, shared AKS platform team, observability (Dynatrace) team, a lead from each pilot org |
 | Approvers | To be named: security and the shared AKS platform owner |
@@ -13,7 +13,7 @@ _As of Oct 19, 2026_
 
 ## Summary
 
-Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared AKS clusters, alongside the shared services: build and test runners in the nonprod cluster, and only tightly restricted deploy runners in the prod cluster. Runners are each cluster's least-trusted tenant. Each GitHub org gets its own GitHub App, namespace and tainted node pool, runner nodes sit in a subnet that can't reach the shared services, and admission policy enforces every rule. Runner pods and runner nodes scale to zero when no jobs are queued. AKS add-ons and managed features cover admission policy, network policy, node scaling and sandboxing. Dynatrace is the logging and observability platform, Prisma Cloud does runtime detection, and Arctic Wolf monitors security, with Azure Event Hubs carrying job logs, GitHub audit events and Azure logs to them. Prod deploy runners keep a warm standby in a DR region.
+Run GitHub's Actions Runner Controller (ARC 0.15) on the enterprise's two shared AKS clusters, alongside the shared services: build and test runners in the nonprod cluster, and only tightly restricted deploy runners in the prod cluster. Runners are each cluster's least-trusted tenant. Each GitHub org gets its own GitHub App, namespace and tainted node pool, runner nodes sit in a subnet that can't reach the shared services, and admission policy enforces every rule. Runner pods and runner nodes scale to zero when no jobs are queued. AKS add-ons and managed features cover admission policy, network policy, node scaling and sandboxing. Dynatrace is the logging and observability platform, Prisma Cloud does runtime detection, and Arctic Wolf monitors security, with Azure Event Hubs carrying job logs, GitHub audit events and Azure logs to them. Every change goes through Git: Terraform builds the Azure side and bootstraps Argo CD, which deploys everything inside the clusters, so no one runs `kubectl apply`. Prod deploy runners keep a warm standby in a DR region.
 
 ## Context and scope
 
@@ -50,7 +50,8 @@ Each goal and how the design meets it:
 | Security | A threat model maps each threat to preventive controls and detections. Policy-enforced guardrails cover namespaces, pods, containers, network, credentials, images and GitHub settings, with SIEM detections and a tested quarantine runbook. |
 | Monitoring | ARC and cluster metrics, dashboards and alerts in Dynatrace, with service-level targets, alerts routed to on-call and the SOC, and a synthetic canary job that proves each runner path end to end. |
 | Managed over self-run | AKS add-ons and managed features cover policy, networking, scaling and sandboxing; the enterprise's Dynatrace and Prisma Cloud agents cover observability and runtime security. The platform team runs only ARC, the job-log exporter and the Key Vault secret sync. |
-| Disaster recovery | Runners hold no state, so recovery is the same Terraform and Helm in another cluster. Prod deploy runners keep a warm standby; CI can fall back to GitHub-hosted runners. |
+| Change control | Every change is a reviewed pull request. Terraform pipelines build the Azure side; Argo CD deploys everything in the clusters and reverts drift. People have read-only cluster access, with break-glass admin for emergencies. |
+| Disaster recovery | Runners hold no state, so recovery is the same Terraform and GitOps repo in another cluster. Prod deploy runners keep a warm standby; CI can fall back to GitHub-hosted runners. |
 
 Non-goals:
 
@@ -83,6 +84,7 @@ Wherever AKS offers an add-on or managed feature, the design uses it, so Microso
 | Pod logs | The Dynatrace Operator's log module ([docs](https://docs.dynatrace.com/docs/ingest-from/setup-on-k8s/deployment/k8s-log-monitoring)) | Container insights with data export, or an OpenTelemetry collector |
 | Metrics, dashboards and alerts | Dynatrace, scraping ARC's Prometheus metrics through its ActiveGate ([docs](https://docs.dynatrace.com/docs/observe/infrastructure-observability/container-platform-monitoring/kubernetes-monitoring/monitor-prometheus-metrics)) | Managed Prometheus and Grafana |
 | Network flow logs (optional) | Container network logs, part of Advanced Container Networking Services (paid) ([docs](https://learn.microsoft.com/en-us/azure/aks/container-network-observability-logs)) | Self-run Hubble |
+| GitOps deployment | The AKS Argo CD extension, installed by Terraform ([Deployment with GitOps](#deployment-with-gitops)) | A self-installed Argo CD, or Terraform-managed Helm releases as in the PoC |
 | Patching, image cleanup, identity, secrets encryption, cost showback | Node OS and cluster auto-upgrade channels, Image Cleaner, workload identity, KMS etcd encryption, the cost analysis add-on | Scripts and cron jobs |
 
 Considered but not used yet:
@@ -91,7 +93,7 @@ Considered but not used yet:
 - **Defender for Containers, Container insights and Managed Prometheus** would duplicate Prisma Cloud and Dynatrace, so they stay off. Container insights with data export to Event Hubs is the fallback if the Dynatrace Operator isn't allowed on runner nodes.
 - **Key Vault Secrets Provider add-on** syncs a Key Vault secret into a Kubernetes secret only while a pod in the same namespace mounts it. That would put a Key Vault identity in every runner namespace, so External Secrets Operator (as in the PoC) or ARC's built-in Key Vault mode does this job instead ([GitHub App credentials](#github-app-credentials)).
 
-Still run by the platform team: ARC (controller and listeners), the job-log exporter and External Secrets Operator. The Dynatrace Operator, the Prisma Cloud Defender and the Arctic Wolf sensor and syslog forwarder are run by their owning teams.
+Still run by the platform team, all deployed by Argo CD from Git: ARC (controller and listeners), the job-log exporter and External Secrets Operator. The Dynatrace Operator, the Prisma Cloud Defender and the Arctic Wolf sensor and syslog forwarder are run by their owning teams.
 
 ## Production and non-production
 
@@ -216,13 +218,43 @@ The image pipeline:
 3. **Scan** with Prisma Cloud (`twistcli`) or Trivy; fail on critical or high findings that have a fix.
 4. **Sign and push:** SBOM, signature (Notation or cosign) and an immutable tag `<runner-version>-<yyyymmdd>` in ACR; record the digest.
 5. **Canary:** roll to the platform scale set and smoke-test a container job, a service container and a Kata Docker build.
-6. **Promote by ring:** a PR bumps the digest in Helm values; the deployment pipeline rolls out platform → pilot org → all orgs.
+6. **Promote by ring:** a PR bumps the digest in the GitOps repo's Helm values, and Argo CD rolls it out: platform → pilot org → all orgs, one PR per ring.
 7. **Enforce:** admission policy admits only digest-pinned images from the platform ACR in runner namespaces, and only the pipeline can push there.
 8. **Retire:** keep the last 3 versions for rollback; ACR purge removes older ones.
 
 Rollback is a revert of the digest PR: new pods start on the previous image, with no node changes.
 
 **Runner version guardrail:** since Sep 29, 2026, GitHub Enterprise Cloud blocks runners below 2.329.0 from registering, and runners below a higher execution minimum stop running jobs ([changelog](https://github.blog/changelog/2026-09-28-self-hosted-runner-version-enforcement-date-has-moved/)). Treat every runner release as a mandatory rebuild, and alert from GitHub's runner version deprecation API.
+
+## Deployment with GitOps
+
+Every change reaches the clusters through a reviewed pull request. No one runs `kubectl apply`, `helm install` or a Terraform apply from a laptop. Terraform builds the Azure side and bootstraps Argo CD; Argo CD deploys everything inside the clusters from Git.
+
+| Layer | What it holds | Applied by |
+| --- | --- | --- |
+| Azure | Runner subnets and NSGs, firewall rules, classic node pools (Kata), Key Vaults, managed identities and federated credentials, ACR, Event Hubs, Azure Policy assignments | Terraform, from a pipeline on merge |
+| Bootstrap | The AKS Argo CD extension and its settings, External Secrets Operator, the ExternalSecret that gives Argo CD its Git credential, and one root Application per cluster | The same Terraform pipeline, as a cluster extension and Helm releases, so it needs no `kubectl` |
+| Cluster contents | Namespaces with their labels, quotas and network policies; ValidatingAdmissionPolicies; NAP NodePools; the ARC controller and scale sets; hook templates; SecretStores and ExternalSecrets; the job-log exporter | Argo CD, from the GitOps repo |
+
+The Dynatrace Operator and the Prisma Cloud Defender follow their owning teams' deployment path.
+
+```text
+clusters/<nonprod|prod|dr>/
+  root.yaml        # root Application (app of apps)
+  platform/        # ARC controller, policies, NodePools, job-log exporter
+  orgs/<org>/      # namespaces, quota, network policy, ExternalSecret, scale set values
+```
+
+- **The AKS Argo CD extension** (`Microsoft.ArgoCD`) is installed with Terraform's `azurerm_kubernetes_cluster_extension`, and Microsoft patches and upgrades it. Its settings go through the extension's configuration, not Argo CD's ConfigMaps; HA mode needs four nodes; and the cluster must use a managed identity ([docs](https://learn.microsoft.com/en-us/azure/azure-arc/kubernetes/tutorial-use-gitops-argocd)). Microsoft's docs list it as generally available on AKS, but its April 2026 Entra ID guide used the preview release train ([blog](https://blog.aks.azure.com/2026/04/22/argocd-extension-with-microsoft-entra)), so confirm the release train before prod. If the shared clusters already run Argo CD, use that instance with the runner AppProjects instead ([Open decisions](#open-decisions)).
+- **One owner per resource.** Terraform owns the Azure and bootstrap layers, Argo CD owns the cluster contents, and nothing is managed by both. The PoC used Terraform-managed Helm releases; the production build starts on Argo CD, so nothing moves. Reusing a PoC cluster would mean removing its releases from Terraform state first, with a `removed` block and `destroy = false`.
+- **No human writes.** Platform engineers get read-only cluster roles. Argo CD and the Terraform pipeline's identity are the only writers, and Argo CD's self-heal reverts drift. Break-glass admin through PIM is for emergencies only; a fix made that way goes into Git straight after, or self-heal reverts it.
+- **Secrets never in Git.** Git holds SecretStores and ExternalSecrets; the values stay in Key Vault. Argo CD reads the GitOps repo with its own GitHub App (Contents: read on that repo only), whose key is in Key Vault and synced by External Secrets.
+- **Argo CD admin equals cluster admin** ([docs](https://learn.microsoft.com/en-us/azure/azure-arc/kubernetes/tutorial-use-gitops-argocd)). Sign-in is Entra ID SSO with group-based roles, the local admin account is off, only platform engineers can sync by hand, and its audit events go to the SIEM. A platform AppProject holds `arc-system`, CRDs and policies; each org's AppProject allows only that org's namespaces and no cluster-scoped resources.
+- **The GitOps repo controls the clusters.** It has branch protection, required CODEOWNERS reviews (platform for everything, security for policy and network folders) and no bypass. CI renders every chart and runs schema and policy tests before merge.
+- **Order.** Sync waves run CRDs and the ARC controller first, then each org's namespace, policies and secrets, then its scale sets. Child Applications wait for each other only with Argo CD's Application health check turned on, which is an extension setting ([docs](https://argo-cd.readthedocs.io/en/stable/operator-manual/health/)). Removal runs the other way: scale sets before the controller, because the controller clears their finalizers.
+- **Resources ARC creates.** The controller creates listeners, ephemeral runner sets and runner pods. Argo CD's annotation tracking, the default since 3.0 ([docs](https://argo-cd.readthedocs.io/en/release-3.0/user-guide/resource_tracking/)), keeps Argo CD from claiming or pruning them, and `ignoreDifferences` covers fields the controller writes on the scale sets.
+- **Promotion.** One repo with a folder per cluster. A change merges to nonprod first, and a second PR promotes it to prod after the soak. Chart versions are pinned, and images are pinned by digest.
+- **The pipeline doesn't depend on its own runners.** The Terraform pipeline runs on GitHub-hosted runners with Azure private networking, so it reaches the private API server during a runner outage, and it signs in to Azure with GitHub OIDC, not a stored secret.
 
 ## Security design
 
@@ -262,12 +294,13 @@ What to set at each level, where it's set, and what enforces it. "Admission poli
 | Azure | Private endpoints for ACR, Key Vault and Event Hubs; diagnostic settings on every resource | Terraform | Azure Policy |
 | Azure | A Key Vault per org, with soft delete, purge protection and Azure RBAC | Terraform | Azure Policy |
 | Cluster | Private API server; Entra ID and Azure RBAC; no standing admin; RBAC without wildcards or escalation; KMS encryption for secrets; auto-upgrade | Terraform, PIM | Azure Policy, AKS, Kubernetes RBAC |
-| Node pool | A pool per org, tainted `gh-org=<org>`, with a CPU cap and daily node expiry; Kata pools for Docker jobs; only approved agents tolerate runner taints | Terraform (NAP NodePools) | NAP; admission policy keeps other pods off |
+| Cluster | Changes only from Git: Argo CD and the Terraform pipeline are the only writers; people are read-only; self-heal reverts drift | GitOps repo rulesets, Azure RBAC | Branch protection, Argo CD, Azure RBAC |
+| Node pool | A pool per org, tainted `gh-org=<org>`, with a CPU cap and daily node expiry; Kata pools for Docker jobs; only approved agents tolerate runner taints | GitOps (NAP NodePools); Terraform (Kata pools) | NAP; admission policy keeps other pods off |
 | Node pool | Azure Linux 3, Trusted Launch on runc pools, ephemeral OS disks with encryption at host, SSH off, no public IPs | Terraform | Azure Policy, AKS |
-| Namespace | One per org, plus `-docker`, labelled `gh-org=<org>`; no Azure Policy ignore label | Terraform template | VAP |
+| Namespace | One per org, plus `-docker`, labelled `gh-org=<org>`; no Azure Policy ignore label | GitOps template | VAP |
 | Namespace | Pod Security `restricted`; `privileged` only in `-docker` namespaces | Namespace label | PSA |
-| Namespace | Default-deny network policy; ResourceQuota and LimitRange | Terraform template | Azure CNI Powered by Cilium; Kubernetes |
-| Namespace | Runner service account with only what the hooks need, no secret read; no human write access | Terraform, Helm | Kubernetes RBAC |
+| Namespace | Default-deny network policy; ResourceQuota and LimitRange | GitOps template | Azure CNI Powered by Cilium; Kubernetes |
+| Namespace | Runner service account with only what the hooks need, no secret read; no human write access | GitOps (Helm values) | Kubernetes RBAC |
 | Pod | The org's node selector and toleration, never another org's; no `spec.nodeName` | Helm values, hook template | VAP |
 | Pod | No `hostNetwork`, `hostPID`, `hostIPC`, `hostPath` or `hostPort` | Helm values, hook template | PSA |
 | Pod | No service account token on job pods; CPU, memory and ephemeral-storage limits; `activeDeadlineSeconds` | Helm values, hook template | VAP |
@@ -292,7 +325,7 @@ Three layers check every pod in a runner namespace. The first two are built into
 | Layer | What it enforces | Why this layer |
 | --- | --- | --- |
 | Pod Security Admission at the `restricted` level, set by namespace label | Non-root, no privilege escalation, all capabilities dropped, seccomp, no host namespaces or host paths | Built in; no policy code to write |
-| ValidatingAdmissionPolicy (CEL), managed by Terraform ([docs](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/)) | The org's own node selector and toleration on every pod, and no other org's; no `spec.nodeName`; images only from the platform ACR, pinned by digest; the Kata runtime class in `-docker` namespaces; resource limits and `activeDeadlineSeconds`; no Azure Policy ignore label on runner namespaces | Runs inside the API server and fails closed. It reads the namespace's `gh-org` label, so one policy covers every org. |
+| ValidatingAdmissionPolicy (CEL), deployed by Argo CD ([docs](https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/)) | The org's own node selector and toleration on every pod, and no other org's; no `spec.nodeName`; images only from the platform ACR, pinned by digest; the Kata runtime class in `-docker` namespaces; resource limits and `activeDeadlineSeconds`; no Azure Policy ignore label on runner namespaces | Runs inside the API server and fails closed. It reads the namespace's `gh-org` label, so one policy covers every org. |
 | Azure Policy add-on (Gatekeeper) ([docs](https://learn.microsoft.com/en-us/azure/governance/policy/concepts/policy-for-kubernetes)) | The enterprise's Kubernetes baseline initiative and the built-in allowed-images policy, in deny mode | Managed by AKS, and reports compliance to Azure Policy for audit |
 
 What to plan for:
@@ -301,13 +334,13 @@ What to plan for:
 - **Gatekeeper can fail open.** Upstream Gatekeeper's webhooks default to `failurePolicy: Ignore`, which admits pods while the webhook is down ([chart defaults](https://images.chainguard.dev/directory/community-chart/gatekeeper/defaultValues)). Check the add-on's setting in the pilot. Isolation doesn't depend on it, because the first two layers fail closed.
 - **Azure Policy changes take up to 15 minutes.** The add-on checks for assignment changes and rescans the cluster every 15 minutes. Onboarding an org needs no new assignment, because the placement policy reads the namespace label.
 - **Custom Rego can't read namespace labels.** Custom Azure Policy definitions can't use Gatekeeper's data sync, which is why the placement rules are ValidatingAdmissionPolicy. Azure Policy also accepts custom CEL policies, so the rules can move into Azure Policy later if the enterprise wants every rule there.
-- **The ignore label.** The add-on doesn't deny in a namespace that carries its ignore label. Only Terraform can label runner namespaces, and the ValidatingAdmissionPolicy rejects that label on them.
+- **The ignore label.** The add-on doesn't deny in a namespace that carries its ignore label. Runner namespaces come only from Git through Argo CD, and the ValidatingAdmissionPolicy rejects that label on them.
 - **Azure resources too.** Azure Policy also enforces the Azure side: private endpoints, no public IPs on runner nodes, diagnostic settings, customer-managed keys and allowed VM sizes.
 - **Policy lifecycle.** Policies live in Git and change by PR, with tests in CI ([Vulnerability management and testing](#vulnerability-management-and-testing)). A new rule starts in audit or warn mode (Azure Policy's audit effect, or `validationActions: [Warn, Audit]` on a ValidatingAdmissionPolicy) and moves to deny after a week with no unexpected hits. The platform team writes policies and security approves them. Exceptions go through a PR with an expiry date.
 
 ### Namespaces
 
-- One namespace per org, plus a `-docker` namespace for orgs with Docker jobs, created only from a template. The template adds:
+- One namespace per org, plus a `-docker` namespace for orgs with Docker jobs, created only by Argo CD from a template in Git. The template adds:
   - the label `gh-org=<org>`
   - Pod Security `restricted`; `privileged` only on the `-docker` namespace, where admission policy requires Kata
   - default-deny network policy
@@ -364,7 +397,8 @@ Every runner and job pod gets only what its job needs, for only as long as the j
 
 - **API server:** private, with Entra ID sign-in and Azure RBAC; local accounts disabled. The Kubernetes version stays in support through the cluster auto-upgrade channel.
 - **Admin access:** no standing cluster-admin. Admins get just-in-time access through PIM, and a sealed break-glass account alerts the SOC when used ([Identity and access](#identity-and-access)).
-- **Protected components:** only the platform team can change admission webhooks, ValidatingAdmissionPolicies, CRDs and `arc-system`, where ARC's controller, listeners and App credentials live.
+- **Change path:** people have read-only roles. Argo CD and the Terraform pipeline are the only writers, and only from reviewed PRs ([Deployment with GitOps](#deployment-with-gitops)).
+- **Protected components:** only the platform team's PRs can change admission webhooks, ValidatingAdmissionPolicies, CRDs and `arc-system`, where ARC's controller, listeners and App credentials live.
 - **RBAC hygiene:** no wildcard roles. Only cluster admins have `escalate`, `bind` and `impersonate`. Runner service accounts act only in their own namespace, `pods/exec` in runner namespaces is limited to the runner service account and just-in-time admins, and default service accounts don't mount tokens.
 - **Secrets:** encrypted in etcd with a customer-managed key (KMS). Workload identity is used only by platform components (the job-log exporter and External Secrets), never by runner pods.
 - **Audit:** Kubernetes audit logs go to the SIEM ([Audit](#audit)).
@@ -390,10 +424,12 @@ Every runner and job pod gets only what its job needs, for only as long as the j
 
 | Who | Access | How |
 | --- | --- | --- |
-| Platform engineers | Read on the clusters; admin only when needed | Entra ID groups, Azure RBAC, PIM with approval and a time limit |
+| Platform engineers | Read on the clusters; changes only by PR; admin only for break-glass | Entra ID groups, Azure RBAC, PIM with approval and a time limit |
 | Org owners and developers | No cluster access; they manage workflows and which repos use their runner groups | GitHub org roles |
 | Security and the SOC | Read access to audit logs, Prisma Cloud and Dynatrace | Each tool's roles |
 | Break-glass | Emergency cluster admin | A sealed account, with an alert on every use |
+| Argo CD | Writes cluster contents; reads the GitOps repo | A GitHub App with Contents: read on that repo only; key in Key Vault |
+| Terraform pipeline | Azure resources and the bootstrap layer | GitHub OIDC to a managed identity; no stored secret |
 | ARC controller | Each org's GitHub App credential | Kubernetes secret in `arc-system` or ARC's Key Vault mode |
 | External Secrets | Read on each org's Key Vault | Workload identity, one per org |
 | Job-log exporter | Read-only GitHub App per org; send to Event Hubs | Workload identity |
@@ -572,6 +608,7 @@ Starting alerts, to tune after a month of baseline:
 | Runtime detection | Any high-severity alert in a runner namespace | Run the quarantine runbook |
 | Runner in a deploy group | Registered by anything other than the prod or DR deploy scale sets | Remove the runner, rotate the org's Apps, run the quarantine runbook |
 | Log pipeline | A tool's consumer group falls behind, or an org with running jobs sends no job logs for an hour | Check the tool's connector and the exporter's GitHub App |
+| Argo CD | An app OutOfSync or Degraded for 15 min, or a failed sync | Check the last merge and the app's events; fix in Git |
 | Policy violations | Any denied admission in a runner namespace | Find the source; fix the template or the workflow |
 | Job start time, p95 | Above the agreed target for 15 min | Check node provisioning and image pull |
 | Failed ephemeral runners | Non-zero for 15 min | Check image, GitHub App key, quota |
@@ -584,10 +621,10 @@ Starting alerts, to tune after a month of baseline:
 
 Day-2 operations:
 
-- **Onboard an org:** one PR from a template: namespaces, quota, network policy, NodePool, Key Vault reference and scale sets. The guardrail policies apply automatically through the namespace label.
-- **Drain the queue:** set `minRunners` and `maxRunners` to 0 ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)).
-- **ARC upgrades:** patch upgrades now update in place ([0.15](https://github.blog/changelog/2026-10-01-actions-runner-controller-release-0-15-0/)). Upgrades with CRD changes need scale sets uninstalled and ARC reinstalled ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)), so run them in a change window and drain the queue first.
-- **Infrastructure as code:** Terraform for Azure and Kubernetes resources, with Terraform-managed Helm releases for ARC and scale sets. The PoC implementation is in `poc/terraform/`; any later GitOps migration must explicitly transfer resource ownership.
+- **Onboard an org:** one PR from a template, which adds the org's folder to the GitOps repo: namespaces, quota, network policy, NodePool, Key Vault reference and scale sets. The guardrail policies apply automatically through the namespace label.
+- **Drain the queue:** a PR that sets `minRunners` and `maxRunners` to 0 ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)).
+- **ARC upgrades:** patch upgrades now update in place ([0.15](https://github.blog/changelog/2026-10-01-actions-runner-controller-release-0-15-0/)). Upgrades with CRD changes need scale sets uninstalled and ARC reinstalled ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)), so run them as a sequence of PRs in a change window: drain, remove the scale set apps, upgrade the controller, add them back.
+- **Change path:** Terraform pipelines for the Azure and bootstrap layers, Argo CD for everything in the clusters ([Deployment with GitOps](#deployment-with-gitops)). The PoC in `poc/terraform/` uses Terraform-managed Helm releases and stays as it is.
 - **Runbooks:** quarantine, drain, App key rotation, ARC upgrade, and DR failover and failback, each exercised at least once a year.
 
 ## Resilience and disaster recovery
@@ -606,7 +643,7 @@ Runners hold no state: a job's pod, workspace and node are gone when it ends, an
 
 | Option | How | Recovery | Idle cost | Use for |
 | --- | --- | --- | --- | --- |
-| A. Rebuild from IaC | The same Terraform and Helm build the platform in the DR region's cluster | Hours | None | Nonprod CI |
+| A. Rebuild from IaC | Terraform builds the Azure side and bootstraps Argo CD in the DR region's cluster; Argo CD syncs the rest from the DR folder in Git | Hours | None | Nonprod CI |
 | B. Warm standby | A DR-region cluster runs the same deploy scale sets with the same `runnerScaleSetName`, each in its own runner group. ARC supports this as active-active: either cluster can take a job ([docs](https://docs.github.com/en/actions/how-tos/manage-runners/use-actions-runner-controller/deploy-runner-scale-sets)). With `minRunners: 0`, the standby costs only its listeners. To keep deploys in the primary region normally, hold the standby at `maxRunners: 0` and raise it in a failover. | Minutes | Listeners and controller in the DR cluster | Prod deploy runners |
 | C. GitHub-hosted fallback | Workflows read `runs-on` from an org variable; a failover flips it to GitHub-hosted runners with Azure private networking ([docs](https://docs.github.com/en/enterprise-cloud@latest/admin/configuring-settings/configuring-private-networking-for-hosted-compute-products/about-azure-private-networking-for-github-hosted-runners-in-your-enterprise)) | Minutes | None; per-minute charges when used | Break-glass for a short list of critical CI |
 
@@ -623,7 +660,7 @@ What must survive a regional outage, and how it's protected. The clusters themse
 
 | Item | Where it lives | Protection |
 | --- | --- | --- |
-| Terraform, Helm values, admission policies | Git | Branch protection and review |
+| Terraform and the GitOps repo (Argo CD apps, Helm values, policies) | Git | Branch protection and review |
 | Terraform state | Azure Storage | Geo-redundant account with versioning, soft delete and a delete lock |
 | Runner and job images | ACR | Geo-replica in the DR region; the pipeline can rebuild them |
 | GitHub App keys | Key Vault | Soft delete and purge protection, plus a DR-region vault; a lost key is replaced by generating a new one in GitHub |
@@ -632,10 +669,10 @@ What must survive a regional outage, and how it's protected. The clusters themse
 Failover runbook, owned by the platform on-call with the incident lead:
 
 1. **Declare:** the primary region is down, or will be for longer than the RTO.
-2. **Prod:** raise the DR deploy scale sets' `maxRunners` if they're held at 0, and confirm the canary deploy passes.
+2. **Prod:** merge the prepared, already-approved PR that raises the DR deploy scale sets' `maxRunners` if they're held at 0, and confirm the canary deploy passes.
 3. **Nonprod:** start the IaC rebuild in the DR region; switch critical repos' `runs-on` variable to GitHub-hosted if they can't wait.
 4. **Tell teams,** and watch queue time and the log pipeline in the DR region.
-5. **Fail back:** restore the primary, run its canary, return the DR standby to `maxRunners: 0` and switch the variables back.
+5. **Fail back:** restore the primary, run its canary, return the DR standby to `maxRunners: 0` by PR and switch the variables back.
 
 The runner DR depends on the enterprise's own DR for the hub network (firewall, DNS, private endpoints) and the DR-region shared cluster; confirm both exist and are tested.
 
@@ -675,6 +712,8 @@ The trade-off is cold start: the first job after idle waits for a node to boot a
 | Kyverno for admission policy | Another engine to run; built-in Pod Security Admission and ValidatingAdmissionPolicy plus the Azure Policy add-on cover the rules and fail closed | [Admission policy](#admission-policy) |
 | An OpenTelemetry collector, Container insights or Managed Prometheus | Duplicates Dynatrace, the enterprise's observability platform; Container insights stays the fallback | [Logging and audit](#logging-and-audit) |
 | Defender for Containers, Falco or Tetragon | Duplicates Prisma Cloud, the enterprise's runtime security tool | [Detection and response](#detection-and-response) |
+| Terraform-managed Helm releases, as in the PoC | Every change needs a Terraform run with access to the private API server, and nothing corrects drift between runs | [Deployment with GitOps](#deployment-with-gitops) |
+| Flux, the AKS GitOps extension | Also managed by AKS; Argo CD was chosen for its UI, ApplicationSets and per-team AppProjects | [Deployment with GitOps](#deployment-with-gitops) |
 | Signature checks at admission (AKS Image Integrity) | Preview and audit-only today, so it can't block an image | [AKS add-ons, managed features and enterprise tools](#aks-add-ons-managed-features-and-enterprise-tools) |
 
 ## Risks and mitigations
@@ -687,6 +726,8 @@ The trade-off is cold start: the first job after idle waits for a node to boot a
 | The Gatekeeper webhook fails open | Isolation relies on Pod Security Admission and ValidatingAdmissionPolicy, which fail closed | Platform |
 | Data leaves through the `*.blob.core.windows.net` allowlist entry | Narrow it in the pilot, or alert on upload volume per runner | Security |
 | Host agents can't see inside Kata pods | VM boundary plus audit and flow logs; ask Palo Alto about Kata support | Security |
+| A bad merge to the GitOps repo changes a whole cluster | CODEOWNERS reviews, CI that renders and tests every change, nonprod before prod, revert by PR | Platform |
+| Argo CD is compromised, which equals cluster admin | Entra ID SSO, local admin off, an AppProject per org, a read-only Git credential, audit events to the SIEM | Platform, security |
 | Cold start delays the first job after idle | Measure in the pilot; business-hours warm runners per org | Platform |
 | vCPU quota or runner subnet IPs run out during a burst | Quota per VM family, subnets sized to NodePool caps, capacity alerts | Platform |
 | GitHub deletes run history at the end of the retention window | Job logs kept in Dynatrace and the archive | Platform |
@@ -699,7 +740,7 @@ The trade-off is cold start: the first job after idle waits for a node to boot a
 
 Each stage has an exit test, and the next stage starts only when it passes.
 
-1. **Nonprod foundation:** on the nonprod cluster, the runner subnet and NSG, runner node pools, the admission policies (Pod Security labels, ValidatingAdmissionPolicy, Azure Policy assignments), the Dynatrace Operator and Prisma Cloud Defender, ACR, Key Vault, ARC controller, platform scale set and image pipeline, plus the log pipeline: audit log streaming, Event Hubs and the job-log exporter. Exit: the isolation, credentials, images and logging tests below pass, and the pipeline builds the golden image on its own runners.
+1. **Nonprod foundation:** on the nonprod cluster, the GitOps repo and the Argo CD bootstrap, the runner subnet and NSG, runner node pools, the admission policies (Pod Security labels, ValidatingAdmissionPolicy, Azure Policy assignments), the Dynatrace Operator and Prisma Cloud Defender, ACR, Key Vault, ARC controller, platform scale set and image pipeline, plus the log pipeline: audit log streaming, Event Hubs and the job-log exporter. Exit: the isolation, credentials, images and logging tests below pass, and the pipeline builds the golden image on its own runners.
 2. **Security sign-off:** security reviews the guardrail tests and accepts the residual risk.
 3. **Pilot org:** `kubernetes-novolume` scale set, NodePool, quotas, metrics, dashboards and the canary in nonprod. Exit: job start time measured against the proposed targets, and idle spend equals the floor.
 4. **Docker tier:** Kata pool and `dind` scale set, plus a security review. Exit: `docker build` works in the sandbox and a container-escape test fails.
@@ -715,6 +756,7 @@ Validation tests, run in the pilot and again after every cluster, ARC or policy 
 | Isolation | From a job, reach another org's namespace or a shared-service subnet | Blocked |
 | Credentials | From a job, call the metadata endpoint or WireServer; read the GitHub App secret from a runner pod | Blocked |
 | Images | Run a job image from outside the platform ACR, or by tag instead of digest | Rejected |
+| Change control | Edit a runner namespace's object with break-glass access; push to the GitOps repo without review | Argo CD reverts the edit; the push is blocked |
 | Docker tier | Run `docker build` in a Kata pod; attempt a known container escape | Build works; escape fails |
 | Runtime detection | Open a shell in a runner pod; run a miner signature | Prisma Cloud alert reaches the SOC |
 | Logging | Finish a workflow run | Its job log and audit events appear in Dynatrace |
@@ -747,6 +789,7 @@ These decisions shape the build; the recommendation column is the default if no 
 | Runtime detection on Kata pods | VM boundary plus audit and flow logs; a Prisma Cloud option, if Palo Alto has one | Ask Palo Alto in the pilot |
 | Container network logs | Off; on | Off at first: VNet and firewall logs map flows to an org by node. Turn on if security wants per-pod flows and accepts the charge, which covers every node in the shared cluster |
 | Image signature check at admission | Wait for AKS Image Integrity to support deny; run Ratify ourselves | Wait, with digest-pinned images from the platform ACR meanwhile |
+| GitOps engine | The shared clusters' existing Argo CD, if there is one; the AKS Argo CD extension per cluster; Flux | The existing instance with runner AppProjects; otherwise the AKS extension |
 | Service-level targets | The proposals in Monitoring and operations | Agree after a month of pilot data |
 | Enterprise IP allow list | Off; on, with the firewall's egress IPs allowed for the runner Apps | Evaluate with security. A stolen App key would stop working outside the allowed IPs, but the list applies to every user and integration in the enterprise ([docs](https://docs.github.com/en/enterprise-cloud@latest/apps/maintaining-github-apps/managing-allowed-ip-addresses-for-a-github-app)) |
 
@@ -798,6 +841,10 @@ These decisions shape the build; the recommendation column is the default if no 
 - [Monitor the AKS API server and audit logs](https://learn.microsoft.com/en-us/azure/aks/monitor-apiserver) (Microsoft Learn)
 - [OpenID Connect reference](https://docs.github.com/en/actions/reference/security/oidc) (GitHub Docs)
 - [Azure Firewall DNS settings](https://learn.microsoft.com/en-us/azure/firewall/dns-settings) (Microsoft Learn)
+- [Deploy applications with GitOps and Argo CD](https://learn.microsoft.com/en-us/azure/azure-arc/kubernetes/tutorial-use-gitops-argocd) (Microsoft Learn)
+- [Argo CD extension with Microsoft Entra ID](https://blog.aks.azure.com/2026/04/22/argocd-extension-with-microsoft-entra) (AKS blog, Apr 22, 2026)
+- [Resource health](https://argo-cd.readthedocs.io/en/stable/operator-manual/health/) (Argo CD docs)
+- [Resource tracking](https://argo-cd.readthedocs.io/en/release-3.0/user-guide/resource_tracking/) (Argo CD docs)
 
 ## Glossary
 
@@ -812,6 +859,9 @@ These decisions shape the build; the recommendation column is the default if no 
 | OIDC | GitHub's OpenID Connect tokens, which jobs exchange for Azure access without stored secrets |
 | ActiveGate | Dynatrace's in-cluster gateway that sends data to Dynatrace and scrapes Prometheus metrics |
 | vLC | Arctic Wolf's virtual log collector, the sensor that receives syslog |
+| Argo CD | GitOps controller that applies what's in Git to the cluster and reverts drift |
+| AppProject | Argo CD's limit on what a set of apps may deploy, and where |
+| Sync wave | Argo CD's ordering of resources within a sync |
 | RPO, RTO | Recovery point and recovery time objectives |
 
 ## Revision history
@@ -825,3 +875,4 @@ These decisions shape the build; the recommendation column is the default if no 
 | 0.5 | Oct 19, 2026 | Guardrails-by-level table; design-document structure: context, goals, alternatives, risks, validation, glossary |
 | 0.6 | Oct 19, 2026 | Security design: node pools, Kubernetes cluster, identity and access, audit and compliance; network, policy-lifecycle and OIDC additions |
 | 0.7 | Oct 19, 2026 | Least privilege per job; OIDC role assignments scoped per repo or environment |
+| 0.8 | Oct 29, 2026 | Deployment with GitOps: Terraform for Azure and the Argo CD bootstrap, Argo CD for everything in the clusters, no `kubectl apply` |
