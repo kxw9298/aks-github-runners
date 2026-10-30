@@ -6,12 +6,15 @@ This runbook sets up the GitHub App that ARC uses to register runners for **one 
 
 The job-log exporter needs a separate, read-only App. It isn't covered here.
 
+**No `kubectl apply`.** Every cluster change in this runbook is a pull request to the GitOps repo, which Argo CD syncs ([Deployment with GitOps](high-level-design.md#deployment-with-gitops)). `kubectl` appears only in read-only checks.
+
 ## Roles
 
 | Role | Does |
 | --- | --- |
 | Org owner, or a member with the GitHub App manager role | Creates the runner group, registers and installs the App, generates its key |
-| Platform engineer | Uploads the key to Key Vault, configures ARC, runs the checks |
+| Platform engineer | Uploads the key to Key Vault, opens the GitOps PR, runs the checks |
+| Platform reviewer (GitOps repo CODEOWNER) | Reviews and approves the GitOps PR |
 | Security | Reviews the App's permissions; owns the alerts on App changes |
 
 ## Values to fill in
@@ -28,12 +31,15 @@ Agree these before starting. Only the private key is secret; the App ID and inst
 | Key Vault | The org's nonprod vault | `kv-arc-payments-np` |
 | Key Vault secret | `github-app-credentials` | `github-app-credentials` |
 | Kubernetes secret synced by External Secrets | `github-app` | `github-app` |
+| GitOps folder | `clusters/nonprod/orgs/<org>/` | `clusters/nonprod/orgs/payments/` |
+| Argo CD app for the scale set | `arc-<org>-linux` | `arc-payments-linux` |
 
 ## Before you start
 
 - [ ] The org's nonprod Key Vault exists and meets Step 5a.
 - [ ] External Secrets' workload identity has Key Vault Secrets User on the secret `github-app-credentials` only (Step 5b).
-- [ ] In the nonprod cluster: the ARC controller and External Secrets Operator are installed, the runner namespace exists, and its SecretStore points at the org's vault.
+- [ ] In the nonprod cluster, Argo CD runs the ARC controller and External Secrets Operator, and both show Synced and Healthy.
+- [ ] The org's GitOps folder, merged by an earlier onboarding PR, defines its runner namespace and a SecretStore that points at the org's vault. Argo CD shows them Synced.
 - [ ] The credentials Terraform stack can write to the vault using write-only arguments, following the same pattern as the PoC ([keyvault-credentials.md](keyvault-credentials.md)).
 - [ ] The firewall allows the GitHub endpoints ARC needs ([GitHub docs](https://docs.github.com/en/enterprise-cloud@latest/actions/concepts/runners/communicating-with-self-hosted-runners)).
 - [ ] If the org or enterprise uses an IP allow list, the firewall's egress IPs are allowed for this App.
@@ -156,7 +162,7 @@ Never pass the key with `--value`, because it would land in shell history and pr
 ```bash
 az keyvault secret show --vault-name <vault> --name github-app-credentials \
   --query "{enabled:attributes.enabled, expires:attributes.expires, contentType:contentType}"
-kubectl get externalsecret github-app -n arc-<org>    # SecretSynced, Ready
+kubectl get externalsecret github-app -n arc-<org>    # read-only; SecretSynced, Ready
 ```
 
 Then:
@@ -170,7 +176,7 @@ The design's alternative is ARC's built-in Key Vault mode, which reads the secre
 
 ## Step 6: Configure the scale set
 
-Set these in the org's scale set Helm values, which Terraform manages:
+Open a PR to the GitOps repo that adds the org's scale set values file, `clusters/nonprod/orgs/<org>/linux-values.yaml`:
 
 ```yaml
 githubConfigUrl: https://github.com/<org>
@@ -183,13 +189,16 @@ containerMode:
   type: kubernetes-novolume
 ```
 
-The node selector, toleration and security context come from the org's template, as described in the design. Apply the reviewed Terraform plan.
+The node selector, toleration and security context come from the org's template, as described in the design. The same PR adds the org to the scale set ApplicationSet, if the onboarding PR didn't.
+
+After a platform reviewer approves the PR, merge it. Argo CD creates the scale set within a few minutes. Don't apply anything by hand. Argo CD's self-heal would revert it, and the change would be missing from Git.
 
 ## Step 7: Verify
 
-Run these checks without printing secret contents:
+Run these read-only checks without printing secret contents:
 
 ```bash
+argocd app get arc-<org>-linux                           # Synced, Healthy
 kubectl get secretstore,externalsecret -n arc-<org>      # both Ready / SecretSynced
 kubectl get secret github-app -n arc-<org>               # exists; don't decode it
 kubectl get autoscalingrunnersets -n arc-<org>           # scale set present
@@ -230,23 +239,23 @@ Rotate on a fixed schedule, for example every 90 days, and whenever someone who 
 
 1. Generate a new private key on the App's settings page. The old key keeps working until you delete it.
 2. Upload the new key to `github-app-credentials` as a new version, with a new expiration date (Step 5d). With the PoC stack, that means incrementing `credential_revision`.
-3. Wait for External Secrets to sync, which takes about a minute. If the listener doesn't pick up the change, restart it through the ARC controller.
+3. Wait for External Secrets to sync, which takes about a minute. If the listener doesn't pick up the change, merge a PR that changes an annotation in the scale set's `listenerTemplate`, so ARC recreates the listener. Confirm this step in the pilot.
 4. Run the smoke workflow.
 5. Delete the old key in GitHub, then delete the downloaded file.
 
 ## If the key leaks
 
 1. **Revoke the key:** delete it on the App's settings page. If you can't tell which key leaked, delete all of them, or suspend the installation under **Settings → GitHub Apps → Configure → Suspend**.
-2. **Stop the runners:** set the scale set's `minRunners` and `maxRunners` to 0.
+2. **Stop the runners:** merge a PR that sets the scale set's `minRunners` and `maxRunners` to 0. Suspending the installation in step 1 already stops new registrations.
 3. **Find rogue runners:**
    - Check the org's runners and runner groups for anything that isn't an ARC runner from this scale set, and remove it.
    - Search the audit log for runner registrations and App events since the leak.
-4. **Issue a new key:** follow Step 3 and Step 5, then unsuspend the installation and restore the scale set.
+4. **Issue a new key:** follow Step 3 and Step 5, then unsuspend the installation and restore the scale set by PR.
 5. **Review:** with security, check the firewall, Key Vault and Kubernetes audit logs for how the key was taken. Follow the quarantine runbook in the design if a runner pod was involved.
 
 ## Decommission
 
-1. Set the scale set to 0, then remove it through Terraform.
+1. Merge a PR that sets the scale set's `maxRunners` to 0. When running jobs finish, merge a second PR that removes the scale set from the GitOps repo. Argo CD prunes it while the ARC controller is still running, so the scale set's finalizers clear. Remove the org's folder in a later PR, once nothing else uses it.
 2. Uninstall the App from the org, then delete the App from **Settings → Developer settings → GitHub Apps**.
 3. Delete `github-app-credentials` from the vault. It stays soft-deleted for the vault's retention period.
 4. Delete the runner group if nothing else uses it.
@@ -261,6 +270,7 @@ Rotate on a fixed schedule, for example every 90 days, and whenever someone who 
 | Jobs stay queued | The `runs-on` label doesn't match `runnerScaleSetName`; the repo isn't in the runner group; the installation is suspended; or the listener isn't ready | Check each one in that order |
 | Jobs fail because a job container is required | The workflow has no `container:` | Add a job container from the platform ACR |
 | ExternalSecret isn't synced | Workload identity, the Key Vault role assignment, or the vault's network access | Check the SecretStore status and the identity's role on the secret |
+| Argo CD app is OutOfSync or Degraded | A rendering error, an admission policy denial, or a sync wave waiting on another app | Check the app's sync result and events in Argo CD; fix it in Git, never by hand |
 
 ## References
 
@@ -273,3 +283,4 @@ Rotate on a fixed schedule, for example every 90 days, and whenever someone who 
 - [Azure Key Vault soft-delete overview](https://learn.microsoft.com/en-us/azure/key-vault/general/soft-delete-overview) (Microsoft Learn)
 - [Terraform write-only arguments](https://developer.hashicorp.com/terraform/language/manage-sensitive-data/write-only) (HashiCorp)
 - [External Secrets Azure Key Vault provider](https://external-secrets.io/latest/provider/azure-key-vault/) (External Secrets)
+- [Deploy applications with GitOps and Argo CD](https://learn.microsoft.com/en-us/azure/azure-arc/kubernetes/tutorial-use-gitops-argocd) (Microsoft Learn)
